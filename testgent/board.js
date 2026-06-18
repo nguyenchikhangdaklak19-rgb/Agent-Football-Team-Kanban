@@ -8,6 +8,8 @@
  */
 const fs = require("fs");
 const path = require("path");
+const { load: storeLoad, save: storeSave, findTask } = require("./lib/store.js");
+const { DEFAULT_WORKFLOW, applyMove } = require("./lib/workflow.js");
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -28,36 +30,9 @@ const now = () => new Date().toISOString();
 
 function load() {
   if (!fs.existsSync(FILE)) fail("Không tìm thấy " + FILE + '. Chạy "node board.js init" trước.');
-  return JSON.parse(fs.readFileSync(FILE, "utf8"));
+  return storeLoad(FILE);
 }
-function save(d) { fs.writeFileSync(FILE, JSON.stringify(d, null, 2) + "\n"); }
-
-function findTask(d, id) {
-  for (const p of d.projects)
-    for (const e of p.epics)
-      for (const t of e.tasks)
-        if (t.id === id) return { project: p, epic: e, task: t };
-  return null;
-}
-
-const DEFAULT_WORKFLOW = {
-  states: ["backlog", "progress", "test", "uat", "done"],
-  labels: { backlog: "Chờ làm", progress: "Đang làm", test: "Đang test", uat: "UAT", done: "Xong" },
-  transitions: [
-    { from: "backlog", to: "progress", by: "engineer" },
-    { from: "progress", to: "test", by: "engineer" },
-    { from: "test", to: "uat", by: "qa", requires: "tests_pass" },
-    { from: "test", to: "backlog", by: "qa", flag: "reject" },
-    { from: "uat", to: "done", by: "po" },
-    { from: "uat", to: "backlog", by: "po", flag: "reject" }
-  ],
-  rules: [
-    "Mọi thay đổi trạng thái phải đi qua công cụ board (không sửa file trực tiếp).",
-    "Chỉ chấp nhận bước có trong 'transitions'. Bước không hợp lệ bị từ chối.",
-    "Quyền chuyển theo 'by': engineer / qa / po. Chỉ 'po' được đẩy sang 'done'.",
-    "Bước test -> uat yêu cầu test pass (requires: tests_pass)."
-  ]
-};
+function save(d) { storeSave(FILE, d); }
 
 // ---------- move ----------
 if (cmd === "move") {
@@ -67,23 +42,16 @@ if (cmd === "move") {
   const d = load();
   const f = findTask(d, id);
   if (!f) fail("Task không tồn tại: " + id);
+  const wf = d.workflow || DEFAULT_WORKFLOW;
   const from = f.task.status;
-  const tr = d.workflow.transitions.find((x) => x.from === from && x.to === to && x.by === by);
-  if (!tr) {
-    const allowed = d.workflow.transitions
+  const res = applyMove(wf, f.task, to, by, { testsPass: hasFlag("tests-pass"), now: now() });
+  if (!res.ok) {
+    const allowed = wf.transitions
       .filter((x) => x.from === from)
       .map((x) => "  " + from + " → " + x.to + "  (--by " + x.by + (x.requires ? ", cần " + x.requires : "") + (x.flag ? ", " + x.flag : "") + ")");
     fail("Bước KHÔNG hợp lệ: " + from + " → " + to + " --by " + by + "\nTừ \"" + from + "\" chỉ cho phép:\n" + (allowed.length ? allowed.join("\n") : "  (không có — đây là trạng thái cuối)"));
   }
-  if (tr.requires === "tests_pass" && !hasFlag("tests-pass"))
-    fail("Bước " + from + " → " + to + " yêu cầu test pass. Thêm cờ --tests-pass sau khi toàn bộ test xanh.");
-  f.task.status = to;
-  if (tr.flag === "reject") f.task.reject = true;
-  else if (to !== "backlog") f.task.reject = false;
-  f.task.history = f.task.history || [];
-  const entry = { to, by, at: now() };
-  if (tr.flag) entry.flag = tr.flag;
-  f.task.history.push(entry);
+  const tr = res.entry;
   save(d);
   ok(id + ": " + from + " → " + to + (tr.flag ? " [" + tr.flag + "]" : "") + " (by " + by + ")");
   process.exit(0);
