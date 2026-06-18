@@ -1,0 +1,15 @@
+{
+  "name": "team-board",
+  "version": "1.0.0",
+  "description": "PO multi-project team board (Project -> Epic -> Task) with a role-aware state machine. Zero dependencies.",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "board": "node board.js"
+  }
+}
