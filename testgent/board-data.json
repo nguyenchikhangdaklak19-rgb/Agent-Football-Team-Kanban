@@ -1,0 +1,115 @@
+{
+  "workflow": {
+    "states": ["backlog", "progress", "test", "uat", "done"],
+    "labels": {
+      "backlog": "Chờ làm",
+      "progress": "Đang làm",
+      "test": "Đang test",
+      "uat": "UAT",
+      "done": "Xong"
+    },
+    "transitions": [
+      { "from": "backlog",  "to": "progress", "by": "engineer" },
+      { "from": "progress", "to": "test",     "by": "engineer" },
+      { "from": "test",     "to": "uat",      "by": "qa",       "requires": "tests_pass" },
+      { "from": "test",     "to": "backlog",  "by": "qa",       "flag": "reject" },
+      { "from": "uat",      "to": "done",     "by": "po" },
+      { "from": "uat",      "to": "backlog",  "by": "po",       "flag": "reject" }
+    ],
+    "rules": [
+      "Mọi thay đổi trạng thái phải đi qua công cụ board (không sửa file trực tiếp).",
+      "Chỉ chấp nhận bước có trong 'transitions'. Bước không hợp lệ bị từ chối.",
+      "Quyền chuyển theo 'by': engineer / qa / po. Chỉ 'po' được đẩy sang 'done'.",
+      "Bước test -> uat yêu cầu test pass (requires: tests_pass)."
+    ]
+  },
+
+  "projects": [
+    {
+      "id": "todo-app",
+      "name": "Ứng dụng To-do",
+      "epics": [
+        {
+          "id": "EP-1",
+          "title": "Quản lý công việc cơ bản",
+          "spec": "spec/todo-basic.md",
+          "tasks": [
+            {
+              "id": "EP-1-T1", "title": "Dựng khung dự án & cấu hình", "agent": "tl", "status": "done",
+              "history": [
+                { "to": "backlog",  "by": "tech-lead", "at": "2026-06-18T08:00:00" },
+                { "to": "progress", "by": "engineer",  "at": "2026-06-18T08:10:00" },
+                { "to": "test",     "by": "engineer",  "at": "2026-06-18T08:40:00" },
+                { "to": "uat",      "by": "qa",        "at": "2026-06-18T09:05:00" },
+                { "to": "done",     "by": "po",        "at": "2026-06-18T09:20:00" }
+              ]
+            },
+            {
+              "id": "EP-1-T2", "title": "API + mô hình dữ liệu công việc", "agent": "engineer", "status": "uat",
+              "deps": ["EP-1-T1"],
+              "history": [
+                { "to": "backlog",  "by": "tech-lead", "at": "2026-06-18T08:00:00" },
+                { "to": "progress", "by": "engineer",  "at": "2026-06-18T09:25:00" },
+                { "to": "test",     "by": "engineer",  "at": "2026-06-18T10:10:00" },
+                { "to": "uat",      "by": "qa",        "at": "2026-06-18T10:45:00" }
+              ]
+            },
+            {
+              "id": "EP-1-T3", "title": "Giao diện danh sách công việc", "agent": "engineer", "status": "test",
+              "deps": ["EP-1-T2"], "depMet": true
+            },
+            {
+              "id": "EP-1-T4", "title": "Thêm / hoàn thành / xoá công việc", "agent": "engineer", "status": "progress",
+              "deps": ["EP-1-T3"]
+            }
+          ]
+        },
+        {
+          "id": "EP-2",
+          "title": "Đăng nhập & tài khoản",
+          "spec": "spec/auth.md",
+          "tasks": [
+            {
+              "id": "EP-2-T1", "title": "Màn hình đăng nhập", "agent": "engineer", "status": "backlog", "reject": true,
+              "history": [
+                { "to": "backlog",  "by": "tech-lead", "at": "2026-06-18T08:00:00" },
+                { "to": "progress", "by": "engineer",  "at": "2026-06-18T09:00:00" },
+                { "to": "test",     "by": "engineer",  "at": "2026-06-18T09:30:00" },
+                { "to": "uat",      "by": "qa",        "at": "2026-06-18T09:50:00" },
+                { "to": "backlog",  "by": "po",        "at": "2026-06-18T10:05:00", "flag": "reject" }
+              ]
+            },
+            { "id": "EP-2-T2", "title": "Xác thực phiên đăng nhập", "agent": "engineer", "status": "backlog", "deps": ["EP-2-T1"] },
+            { "id": "EP-2-T3", "title": "Test luồng đăng nhập",     "agent": "qa",       "status": "backlog", "deps": ["EP-2-T2"] }
+          ]
+        }
+      ]
+    },
+
+    {
+      "id": "landing",
+      "name": "Landing page",
+      "epics": [
+        {
+          "id": "LP-1",
+          "title": "Trang giới thiệu",
+          "spec": "spec/landing-hero.md",
+          "tasks": [
+            { "id": "LP-1-T1", "title": "Layout hero + nội dung", "agent": "engineer", "status": "done" },
+            { "id": "LP-1-T2", "title": "Form đăng ký email",     "agent": "engineer", "status": "uat", "deps": ["LP-1-T1"] },
+            { "id": "LP-1-T3", "title": "Test form gửi email",    "agent": "qa",       "status": "test" }
+          ]
+        },
+        {
+          "id": "LP-2",
+          "title": "Tối ưu & responsive",
+          "spec": "spec/landing-polish.md",
+          "tasks": [
+            { "id": "LP-2-T1", "title": "Responsive mobile",   "agent": "engineer", "status": "progress" },
+            { "id": "LP-2-T2", "title": "Tối ưu tốc độ tải",    "agent": "engineer", "status": "backlog", "deps": ["LP-2-T1"] }
+          ]
+        }
+      ]
+    }
+  ]
+}
