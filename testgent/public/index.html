@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Team Board — Quản lý đa dự án</title>
+<link rel="stylesheet" href="board.css">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h7M4 12h10M4 18h6"/><circle cx="18" cy="17" r="3"/></svg></div>
+      <div><h1>Team Board</h1><p class="sub">Bảng quản lý đa dự án · Project → Epic → Task</p></div>
+    </div>
+    <div class="head-right">
+      <span class="chip-attn" id="pending"></span>
+      <span class="live"><span class="pulse"></span> Đang chạy · 24/7</span>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs" aria-label="Dự án"></nav>
+
+  <section class="strip" aria-label="Tiến độ dự án">
+    <div class="flow">
+      <span class="node">📄 Spec</span><span class="arr">→</span>
+      <span class="node">Đang làm</span><span class="arr">→</span>
+      <span class="node">Đang test</span><span class="arr">→</span>
+      <span class="node you">UAT · Bạn duyệt</span><span class="arr">→</span>
+      <span class="node">Xong</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="progress-wrap">
+      <span class="label" id="prog-label">—</span>
+      <div class="bar"><span id="prog-bar" style="width:0%"></span></div>
+    </div>
+  </section>
+
+  <p class="erow-label">Tính năng (Epic)</p>
+  <div class="epics" id="epics"></div>
+
+  <p class="rule">
+    <b>UAT</b> = bạn tự kiểm và duyệt. <b class="ok">Duyệt</b> → <b>Xong</b> &nbsp;·&nbsp;
+    <b class="no">Trả lại</b> → <b>Chờ làm</b> kèm tag <b class="no">Reject</b> để đội làm lại.
+  </p>
+
+  <div class="legend">
+    <span class="who"><i style="background:var(--ag-tl)"></i> Tech Lead</span>
+    <span class="who"><i style="background:var(--ag-eng)"></i> Engineer</span>
+    <span class="who"><i style="background:var(--ag-qa)"></i> Reviewer</span>
+  </div>
+
+  <main class="board" id="board"></main>
+
+  <p class="footnote">
+    Bản mô phỏng — chọn dự án ở trên, lọc theo Epic, bấm <b>Duyệt</b>/<b>Trả lại</b> ở cột UAT để xem task nhảy cột.<br>
+    Khi đội agent chạy thật, dữ liệu này đọc từ <b>board-data.json</b> và tự cập nhật.
+  </p>
+
+  <script src="board-client.js" defer></script>
+</body>
+</html>
