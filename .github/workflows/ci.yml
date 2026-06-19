@@ -1,0 +1,25 @@
+name: CI
+
+# Run the full test suite on every push and pull request.
+# Zero runtime deps, so no install step is needed.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: npm test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 20]
+    defaults:
+      run:
+        working-directory: testgent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run test suite
+        run: npm test

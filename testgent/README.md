@@ -160,3 +160,39 @@ tasks → history`). The `workflow` block defines the state machine.
 board CLI (`node board.js move ...`) or the PO Approve / Reject buttons in the
 web UI. The state machine enforces valid steps and roles and records full
 per-task history for traceability.
+
+## CI / CD
+
+Two GitHub Actions workflows (`.github/workflows/`):
+
+- **CI** (`ci.yml`) — runs `npm test` on Node 18 + 20 for every push and pull
+  request. The full suite must be green.
+- **Deploy** (`deploy.yml`) — on every push to `main`, a **self-hosted runner**
+  on the Mac Mini pulls the latest `main`, re-runs the suite as a gate, then
+  restarts the launchd service. A red suite blocks the restart (old code keeps
+  serving), matching the "red suite blocks merge" rule.
+
+### One-time setup on the Mac Mini
+
+1. **Install the runner** (Repo → Settings → Actions → Runners → New
+   self-hosted runner → macOS). During `./config.sh`, give it the **`macOS`**
+   label. Run it as a service so it survives reboots:
+
+   ```sh
+   ./svc.sh install && ./svc.sh start
+   ```
+
+2. **Tell the deploy where the production checkout lives.** Repo → Settings →
+   Secrets and variables → Actions → **Variables** → add `DEPLOY_DIR` =
+   absolute path of the repo on the Mac Mini (e.g. `/Users/khang/my-first-app`).
+   Defaults to `$HOME/my-first-app` if unset.
+
+3. **Keep live data outside the repo.** Point the service at a data file that is
+   *not* tracked by git so a deploy never overwrites the PO's board:
+
+   ```sh
+   BOARD_FILE=/var/lib/team-board/board-data.json npm start
+   ```
+
+   Set the same `BOARD_FILE` in the launchd plist's environment. Deploy uses
+   `git pull --ff-only` and will fail loudly rather than clobber local changes.

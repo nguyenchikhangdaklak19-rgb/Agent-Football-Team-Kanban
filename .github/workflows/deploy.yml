@@ -1,0 +1,54 @@
+name: Deploy (Mac Mini)
+
+# Auto-deploy to the internal Mac Mini whenever main is updated.
+# Requires a self-hosted runner (labels: self-hosted, macOS) installed on the
+# Mac Mini, and a repo variable DEPLOY_DIR pointing at the production checkout
+# (Settings -> Secrets and variables -> Actions -> Variables).
+#
+# The launchd service keeps the board running 24/7; this job pulls the latest
+# main, re-runs the test suite as a gate, then restarts the service so it picks
+# up the new code. A red suite blocks the restart (old code keeps serving).
+on:
+  push:
+    branches: [main]
+
+# Never run two deploys at once against the same machine.
+concurrency:
+  group: deploy-macmini
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS]
+    env:
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+      SERVICE_LABEL: com.team.board
+    steps:
+      - name: Update working copy (fast-forward only)
+        run: |
+          set -euo pipefail
+          cd "${DEPLOY_DIR:-$HOME/my-first-app}"
+          git fetch --prune origin
+          git checkout main
+          # --ff-only: refuse to clobber local changes. Keep live board data
+          # OUTSIDE the repo (BOARD_FILE=...) so a deploy never overwrites it.
+          git pull --ff-only origin main
+
+      - name: Run tests (deploy gate)
+        run: |
+          set -euo pipefail
+          cd "${DEPLOY_DIR:-$HOME/my-first-app}/testgent"
+          npm test
+
+      - name: Restart launchd service
+        run: |
+          set -euo pipefail
+          LABEL="${SERVICE_LABEL}"
+          PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+          if launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null; then
+            echo "kickstarted $LABEL"
+          else
+            launchctl unload "$PLIST" 2>/dev/null || true
+            launchctl load "$PLIST"
+            echo "reloaded $LABEL"
+          fi
