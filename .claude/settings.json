@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+
+    "allow": [
+      "Edit",
+      "Write",
+      "Bash(npm test:*)",
+      "Bash(npm run test:*)",
+      "Bash(node board.js:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git worktree:*)"
+    ],
+
+    "deny": [
+      "Bash(rm:*)",
+      "Bash(sudo:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(git push:*)",
+      "Bash(npm publish:*)",
+      "Read(./.env)",
+      "Read(./secrets/**)"
+    ]
+  }
+}
