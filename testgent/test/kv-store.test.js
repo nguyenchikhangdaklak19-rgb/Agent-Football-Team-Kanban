@@ -278,74 +278,103 @@ test("update: throws after max retries on permanent conflict", async () => {
 
 test("concurrency: two concurrent updates both survive (no lost update)", async () => {
   /*
-   * Scenario:
-   *   - Both Agent A and Agent B load the board at version 0.
-   *   - Agent A's save lands first: board gains {_byA: true}, version becomes 1.
-   *   - Agent B then tries to save with stale version 0 → detects conflict
-   *     (version is now 1, not 0) → retries.
-   *   - On retry, Agent B reads the updated board (with _byA: true) and applies
-   *     its own mutation, producing {_byA: true, _byB: true}, version becomes 2.
-   *   - Final board: both mutations present.
+   * Scenario using INCR-reserve CAS:
+   *   - Agent A reads version 0, mutates, calls incr() → gets 1 (=== 0+1), writes.
+   *   - Agent B reads version 0, mutates, calls incr() → gets 2 (!== 0+1), conflict.
+   *   - Agent B retries: reads version 2, mutates, calls incr() → gets 3 (=== 2+1),
+   *     writes on top of Agent A's data (which now has _byA: true).
+   *   - Final board: both _byA and _byB present.
+   *
+   * We simulate this with a client whose incr() returns 2 on the first (conflicting)
+   * call (as if Agent A had already claimed slot 1), then simulates Agent A's board
+   * write, and on the retry incr() returns the correct next value.
    */
 
-  // Shared in-memory KV store (simulates the real backend)
+  // Shared KV state
   let kvBoard = JSON.stringify(SAMPLE_BOARD);
   let kvVersion = 0;
 
-  // Track whether Agent B has done its first (conflicting) attempt
-  let agentBFirstAttempt = true;
+  // Agent A: straightforward update with no conflict
+  const clientA = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
+      return null;
+    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
+    async incr(key) {
+      if (key === "board:version") { kvVersion++; return kvVersion; }
+      return 1;
+    },
+  };
 
-  // We'll intercept the version check inside update() by using a specialized
-  // client that lets Agent A "win" the first write slot.
+  // Run Agent A's update (no conflict)
+  await update((data) => { data._byA = true; }, { client: clientA });
 
-  // Simple shared client (both agents share this store)
-  function makeSharedClient() {
-    return {
-      async get(key) {
-        if (key === "board") return kvBoard;
-        if (key === "board:version") return String(kvVersion);
-        return null;
-      },
-      async set(key, value) {
-        if (key === "board") kvBoard = value;
-      },
-      async incr(key) {
-        if (key === "board:version") {
-          kvVersion += 1;
-          return kvVersion;
-        }
-        return 1;
-      },
-    };
-  }
+  assert.strictEqual(kvVersion, 1, "version should be 1 after Agent A's write");
+  assert.strictEqual(JSON.parse(kvBoard)._byA, true, "_byA should be set after Agent A");
 
-  // Agent A: read version (0), mutate, check version (still 0), write -> version=1
-  const clientA = makeSharedClient();
+  // Reset for Agent B's scenario: simulate B loading at version 0, but
+  // Agent A has already written before B's incr() call.
+  kvBoard = JSON.stringify(SAMPLE_BOARD);
+  kvVersion = 0;
 
-  // Agent B's client: on the FIRST version check (during update's conflict detection),
-  // pretend version is 1 (Agent A already wrote), triggering a retry.
-  // On retry, version check sees current value.
-  let agentBVersionChecks = 0;
+  // Agent B's client: incr() returns 2 on first call (skipping slot 1,
+  // as if A claimed it). This triggers a conflict. The retry incr() increments
+  // normally. Between B's load and B's first incr(), we inject A's board write.
+  let agentBIncrCalls = 0;
   const clientB = {
     async get(key) {
       if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
+      return null;
+    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
+    async incr(key) {
       if (key === "board:version") {
-        agentBVersionChecks++;
-        // First read = load() call returns 0 (same as Agent A loaded)
-        // Second read = conflict check returns 1 (Agent A has written)
-        // Third read = load() in retry sees 1
-        // Fourth read = conflict check sees 1 still -> safe to write
-        if (agentBVersionChecks === 2) {
-          // Simulate Agent A having written between B's load and B's conflict check
-          // Agent A's save:
+        agentBIncrCalls++;
+        if (agentBIncrCalls === 1) {
+          // Simulate Agent A claiming slot 1 first and writing its board
           const dataWithA = JSON.parse(kvBoard);
           dataWithA._byA = true;
           kvBoard = JSON.stringify(dataWithA);
-          kvVersion = 1;
-          return "1"; // conflict: B loaded version 0, but now version is 1
+          kvVersion = 2; // A claimed 1, B now gets 2 → conflict (B read version=0)
+          return 2;
         }
-        return String(kvVersion);
+        // Retry: normal increment
+        kvVersion++;
+        return kvVersion;
       }
+      return 1;
+    },
+  };
+
+  // Agent B's update: will conflict on first attempt (incr returns 2 ≠ 0+1),
+  // then retry reading fresh board (with _byA) and succeed.
+  await update((data) => { data._byB = true; }, { client: clientB });
+
+  // Final board must contain both mutations
+  const finalBoard = JSON.parse(kvBoard);
+  assert.strictEqual(finalBoard._byA, true, "Agent A's mutation must survive");
+  assert.strictEqual(finalBoard._byB, true, "Agent B's mutation must survive");
+  assert.strictEqual(kvVersion, 3, "version should be 3 after both writes");
+});
+
+test("concurrency: explicit retry path is exercised", async () => {
+  /*
+   * Verify the retry counter is exercised with INCR-reserve CAS: we cause
+   * exactly 2 conflicts (incr() returns a value > version+1) before letting
+   * the write through (incr() returns exactly version+1).
+   */
+  let kvBoard = JSON.stringify(SAMPLE_BOARD);
+  let kvVersion = 0;
+  let conflictsSimulated = 0;
+  const NUM_CONFLICTS = 2;
+
+  const client = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
       return null;
     },
     async set(key, value) {
@@ -353,77 +382,19 @@ test("concurrency: two concurrent updates both survive (no lost update)", async 
     },
     async incr(key) {
       if (key === "board:version") {
-        kvVersion += 1;
+        if (conflictsSimulated < NUM_CONFLICTS) {
+          // Simulate an external writer having already claimed the next slot:
+          // bump kvVersion by 2 (external writer took +1, we get +2) so that
+          // incr returns a value !== version+1, causing a conflict.
+          conflictsSimulated++;
+          kvVersion += 2;
+          return kvVersion;
+        }
+        // No more conflicts: normal increment (version+1 = expected next slot).
+        kvVersion++;
         return kvVersion;
       }
       return 1;
-    },
-  };
-
-  // Run Agent A's update (straightforward: no conflict)
-  await update((data) => {
-    data._byA = true;
-  }, { client: clientA });
-
-  // Verify Agent A wrote
-  assert.strictEqual(kvVersion, 1, "version should be 1 after Agent A's write");
-  assert.strictEqual(JSON.parse(kvBoard)._byA, true, "_byA should be set");
-
-  // Reset shared state to simulate both loading before A's write
-  // (re-run from scratch to test the retry scenario using clientB's intercept)
-  kvBoard = JSON.stringify(SAMPLE_BOARD);
-  kvVersion = 0;
-  agentBVersionChecks = 0;
-
-  // Run Agent B's update — it will conflict on first attempt (clientB intercepts
-  // the version check and simulates Agent A writing mid-flight), then retry
-  await update((data) => {
-    data._byB = true;
-  }, { client: clientB });
-
-  // After retry: board should have _byA (from the simulated A write) AND _byB
-  const finalBoard = JSON.parse(kvBoard);
-  assert.strictEqual(finalBoard._byA, true, "Agent A's mutation must survive");
-  assert.strictEqual(finalBoard._byB, true, "Agent B's mutation must survive");
-  assert.strictEqual(kvVersion, 2, "version should be 2 after both writes");
-});
-
-test("concurrency: explicit retry path is exercised", async () => {
-  /*
-   * Verify the retry counter is exercised: we cause exactly 2 conflicts
-   * before letting the write through.
-   */
-  let kvBoard = JSON.stringify(SAMPLE_BOARD);
-  let kvVersion = 0;
-  let versionGetCalls = 0;
-  let conflictsSimulated = 0;
-  const NUM_CONFLICTS = 2;
-
-  const client = {
-    async get(key) {
-      if (key === "board") return kvBoard;
-      if (key === "board:version") {
-        versionGetCalls++;
-        // Every other call to get version (the conflict-check call inside update)
-        // simulates a conflict by returning a bumped version.
-        // load() calls get() for version once; then update() calls it again for CAS.
-        // load() = odd calls, CAS check = even calls.
-        const isConflictCheck = versionGetCalls % 2 === 0;
-        if (isConflictCheck && conflictsSimulated < NUM_CONFLICTS) {
-          conflictsSimulated++;
-          kvVersion++; // simulate external write
-          return String(kvVersion);
-        }
-        return String(kvVersion);
-      }
-      return null;
-    },
-    async set(key, value) {
-      if (key === "board") kvBoard = value;
-    },
-    async incr() {
-      kvVersion++;
-      return kvVersion;
     },
   };
 
@@ -566,27 +537,33 @@ test("REVIEWER concurrency: N interleaved updates all survive (array append)", a
 test("REVIEWER concurrency: retry re-reads fresh data before mutating", async () => {
   let kvBoard = JSON.stringify({ projects: [], counter: 0 });
   let kvVersion = 0;
-  let versionGets = 0;
+  let incrCalls = 0;
   const sawCounterOnEachAttempt = [];
 
   const client = {
     async get(key) {
       if (key === "board") return kvBoard;
-      if (key === "board:version") {
-        versionGets++;
-        // call #2 is the first attempt's CAS check: simulate an external
-        // writer that has bumped counter -> 99 and version -> 1.
-        if (versionGets === 2) {
-          kvBoard = JSON.stringify({ projects: [], counter: 99 });
-          kvVersion = 1;
-          return "1";
-        }
-        return String(kvVersion);
-      }
+      if (key === "board:version") return String(kvVersion);
       return null;
     },
     async set(key, value) { if (key === "board") kvBoard = value; },
-    async incr(key) { if (key === "board:version") { kvVersion++; return kvVersion; } return 1; },
+    async incr(key) {
+      if (key === "board:version") {
+        incrCalls++;
+        // First incr() call is the first attempt's reservation: simulate an
+        // external writer that has already claimed slot 1 and written counter=99.
+        // Return 2 (skipping slot 1) so next (2) !== version+1 (0+1=1) → conflict.
+        if (incrCalls === 1) {
+          kvBoard = JSON.stringify({ projects: [], counter: 99 });
+          kvVersion = 2; // external writer claimed 1, we get 2
+          return 2;
+        }
+        // Retry: normal increment
+        kvVersion++;
+        return kvVersion;
+      }
+      return 1;
+    },
   };
 
   await update((data) => {

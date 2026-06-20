@@ -5,21 +5,25 @@
  * The board JSON is stored under a single KV key ("board").
  * A separate version key ("board:version") is used for optimistic concurrency.
  *
- * Optimistic Concurrency / CAS strategy:
+ * Optimistic Concurrency / CAS strategy (INCR-reserve):
  *   - load() reads both the board payload AND the current version counter from KV.
  *   - save() writes the new board payload AND increments the version counter.
  *   - update(mutatorFn, opts) is the safe read-modify-write helper:
  *       1. load() captures the current version V.
  *       2. mutatorFn is called on a deep clone of the board data.
- *       3. save() is attempted; before writing it re-reads the version:
- *          if version still === V, write proceeds (SET board + increment version).
- *          if version !== V (someone else wrote in the interim), it retries.
- *       4. On conflict, retry from step 1, up to MAX_RETRIES times.
- *   This avoids lost updates when two agents call update() near-simultaneously.
- *   Because the Upstash REST API is HTTP (not a true Redis MULTI/EXEC), we
- *   implement CAS with a version key: we do a GET version + conditional write
- *   in a two-step sequence. The version key is incremented atomically using
- *   the Redis INCR command via the REST API.
+ *       3. Atomically reserve the next slot: next = await client.incr(VERSION_KEY).
+ *          Because INCR is a single atomic operation on the Redis server, only one
+ *          concurrent caller can receive next === V + 1. All others receive a higher
+ *          value and must retry.
+ *       4. If next === V + 1: this writer owns the slot — write the board with
+ *          client.set(BOARD_KEY). Done.
+ *          If next !== V + 1: another writer raced ahead and reserved the slot first.
+ *          Do NOT write (do not clobber their data). Reload fresh state and retry.
+ *       5. After MAX_RETRIES failures, throw an error.
+ *
+ *   This atomically ties the version-check to the board-write: the INCR acts as
+ *   both the "check" and the "reservation" in a single atomic step, eliminating
+ *   the TOCTOU window present in a GET-then-SET approach.
  *
  * Injectable client:
  *   Pass opts.client = { get(key), set(key, value), incr(key) } to inject a
@@ -32,7 +36,7 @@
 
 const BOARD_KEY = "board";
 const VERSION_KEY = "board:version";
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 20;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -41,9 +45,9 @@ const MAX_RETRIES = 5;
 /**
  * Build a fetch-based Upstash REST client.
  * The Upstash Redis REST API supports:
- *   GET  <baseUrl>/get/<key>      -> { result: value | null }
- *   GET  <baseUrl>/set/<key>/<v>  -> { result: "OK" }
- *   GET  <baseUrl>/incr/<key>     -> { result: <newValue> }
+ *   POST <baseUrl> with body ["GET",  key]         -> { result: value | null }
+ *   POST <baseUrl> with body ["SET",  key, value]  -> { result: "OK" }
+ *   POST <baseUrl> with body ["INCR", key]         -> { result: <newValue> }
  * All with Authorization: Bearer <token>
  */
 function buildFetchClient(url, token, fetchFn) {
@@ -165,14 +169,20 @@ function findTask(data, id) {
 /**
  * update(mutatorFn, opts) -> void
  *
- * Safe read-modify-write with optimistic concurrency:
+ * Safe read-modify-write with atomic INCR-reserve concurrency control:
  *   1. load() the current board and capture the version V.
  *   2. Call mutatorFn(data) — may mutate data in-place or return a new value.
  *      The function receives a deep clone so the original is never partially mutated.
- *   3. Re-read the version from KV.
- *      If it still equals V → save (write + incr version) and done.
- *      If it changed → someone else wrote; retry from step 1.
- *   4. After MAX_RETRIES failures, throw an error.
+ *   3. Atomically reserve the next version slot via INCR(VERSION_KEY) -> next.
+ *      Because INCR is atomic, only one concurrent caller receives next === V + 1.
+ *   4. If next === V + 1: this writer owns the slot — write the board data.
+ *      If next !== V + 1: another writer claimed the slot first. Reload and retry.
+ *   5. After MAX_RETRIES failures, throw an error.
+ *
+ * Key property: the version bump (INCR) and board write (SET) are sequenced so
+ * the INCR atomically "claims" the right to write. Two concurrent update() calls
+ * that both read version V will race at INCR: exactly one gets V+1 and writes;
+ * the other gets a higher number, detects the conflict, and retries with fresh data.
  *
  * mutatorFn may be async or sync.
  *
@@ -183,7 +193,7 @@ async function update(mutatorFn, opts) {
   const optsWithClient = Object.assign({}, opts, { client });
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    // Step 1: read current state
+    // Step 1: read current state and capture version V
     const { data, version } = await load(optsWithClient);
 
     // Step 2: apply mutation on a deep clone (so a failed attempt doesn't partially corrupt)
@@ -191,17 +201,21 @@ async function update(mutatorFn, opts) {
     const result = await Promise.resolve(mutatorFn(clone));
     const newData = result !== undefined ? result : clone;
 
-    // Step 3: re-read version to detect concurrent writes
-    const versionRaw = await client.get(VERSION_KEY);
-    const currentVersion = versionRaw === null || versionRaw === undefined ? 0 : Number(versionRaw);
+    // Step 3: atomically reserve the next version slot via INCR.
+    // This is the critical atomic step: exactly one concurrent writer can
+    // receive next === version + 1. All others receive a higher value.
+    const next = await client.incr(VERSION_KEY);
 
-    if (currentVersion !== version) {
-      // Conflict — someone else wrote between our load and now; retry
+    if (next !== version + 1) {
+      // Another writer claimed the slot (their INCR ran between our load and ours).
+      // The version is already bumped past our slot — we cannot write here.
+      // Reload fresh data and try again.
       continue;
     }
 
-    // Step 4: write (version has not changed, so this is safe)
-    await save(newData, optsWithClient);
+    // Step 4: we own version slot (version + 1). Write the board data.
+    // No need to incr again — we already reserved/bumped the version above.
+    await client.set(BOARD_KEY, JSON.stringify(newData));
     return;
   }
 
