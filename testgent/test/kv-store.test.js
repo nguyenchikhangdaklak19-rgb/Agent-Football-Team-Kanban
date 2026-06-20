@@ -463,3 +463,188 @@ test("resolveClient: throws when no client, url, or env vars provided", async ()
     if (savedToken !== undefined) process.env.KV_REST_API_TOKEN = savedToken;
   }
 });
+
+// ===========================================================================
+// REVIEWER edge-case tests
+// ===========================================================================
+//
+// A realistic, in-memory KV backend whose operations are genuinely async
+// (each await yields a microtask turn) and whose INCR is atomic with respect
+// to that single-threaded event loop. This is the faithful model the CAS
+// claim must hold under: two update() calls driven concurrently via
+// Promise.all that interleave at the await boundaries.
+//
+// No real network: this is a pure in-memory object. No console / process.exit.
+// ---------------------------------------------------------------------------
+
+/**
+ * A shared backend object shared by clients handed to concurrent update() calls.
+ * Every op is async and yields control, so two in-flight update() calls
+ * interleave the way they would against a real remote KV.
+ */
+function makeConcurrentBackend(initialBoard, initialVersion) {
+  const state = {
+    board: JSON.stringify(initialBoard),
+    version: initialVersion == null ? 0 : initialVersion,
+  };
+  function client() {
+    return {
+      async get(key) {
+        await Promise.resolve(); // yield: let the other update() advance
+        if (key === "board") return state.board;
+        if (key === "board:version") return String(state.version);
+        return null;
+      },
+      async set(key, value) {
+        await Promise.resolve();
+        if (key === "board") state.board = value;
+      },
+      async incr(key) {
+        await Promise.resolve();
+        if (key === "board:version") {
+          state.version += 1; // atomic w.r.t. the single-threaded loop
+          return state.version;
+        }
+        return 1;
+      },
+    };
+  }
+  return { state, client };
+}
+
+// CRITICAL: this is the lost-update probe the spec demands. Two agents update
+// the SAME board concurrently. Each sets a distinct top-level marker. For the
+// CAS guarantee to hold, BOTH markers must survive in the final persisted board.
+//
+// This test interleaves them via Promise.all so both can read version V before
+// either commits — exactly the window where a naive GET-check-then-SET loses an
+// update. If the adapter's concurrency control is real, both survive; if it is
+// only a non-atomic check-then-act, one mutation is clobbered and this fails.
+test("REVIEWER concurrency: two genuinely-interleaved updates must not lose an update", async () => {
+  const backend = makeConcurrentBackend(SAMPLE_BOARD, 0);
+
+  const updateA = update((data) => {
+    data._byA = true;
+  }, { client: backend.client() });
+
+  const updateB = update((data) => {
+    data._byB = true;
+  }, { client: backend.client() });
+
+  await Promise.all([updateA, updateB]);
+
+  const finalBoard = JSON.parse(backend.state.board);
+  assert.strictEqual(finalBoard._byA, true, "Agent A's mutation must survive");
+  assert.strictEqual(finalBoard._byB, true, "Agent B's mutation must survive");
+});
+
+// Same probe at higher contention: many concurrent updates each appending a
+// distinct id to an array. A correct adapter ends with every id present.
+test("REVIEWER concurrency: N interleaved updates all survive (array append)", async () => {
+  const seed = { projects: [], log: [] };
+  const backend = makeConcurrentBackend(seed, 0);
+
+  const N = 8;
+  const ops = [];
+  for (let i = 0; i < N; i++) {
+    ops.push(update((data) => {
+      data.log.push(i);
+    }, { client: backend.client() }));
+  }
+  await Promise.all(ops);
+
+  const finalBoard = JSON.parse(backend.state.board);
+  const got = finalBoard.log.slice().sort((a, b) => a - b);
+  const want = Array.from({ length: N }, (_, i) => i);
+  assert.deepStrictEqual(got, want,
+    "every concurrent update's append must survive (no lost update)");
+});
+
+// Retry must re-read FRESH data, not reuse the stale snapshot from the first
+// attempt. We force one conflict, then assert the mutator on the retry sees
+// the value written by the conflicting writer.
+test("REVIEWER concurrency: retry re-reads fresh data before mutating", async () => {
+  let kvBoard = JSON.stringify({ projects: [], counter: 0 });
+  let kvVersion = 0;
+  let versionGets = 0;
+  const sawCounterOnEachAttempt = [];
+
+  const client = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") {
+        versionGets++;
+        // call #2 is the first attempt's CAS check: simulate an external
+        // writer that has bumped counter -> 99 and version -> 1.
+        if (versionGets === 2) {
+          kvBoard = JSON.stringify({ projects: [], counter: 99 });
+          kvVersion = 1;
+          return "1";
+        }
+        return String(kvVersion);
+      }
+      return null;
+    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
+    async incr(key) { if (key === "board:version") { kvVersion++; return kvVersion; } return 1; },
+  };
+
+  await update((data) => {
+    sawCounterOnEachAttempt.push(data.counter);
+    data.counter = data.counter + 1;
+  }, { client });
+
+  // First attempt saw 0 then conflicted; retry must have seen the fresh 99.
+  assert.deepStrictEqual(sawCounterOnEachAttempt, [0, 99],
+    "retry mutator must operate on freshly re-read data");
+  assert.strictEqual(JSON.parse(kvBoard).counter, 100,
+    "final value must build on the fresh data (99 -> 100), not the stale 0");
+});
+
+// A mutator that throws must propagate and must NOT persist a partial write.
+test("REVIEWER update: throwing mutator propagates and does not write", async () => {
+  const client = freshClient();
+  const versionBefore = client._store["board:version"];
+  const boardBefore = client._store["board"];
+
+  await assert.rejects(
+    () => update(() => { throw new Error("boom"); }, { client }),
+    /boom/
+  );
+
+  assert.strictEqual(client._store["board:version"], versionBefore,
+    "version must be unchanged when mutator throws");
+  assert.strictEqual(client._store["board"], boardBefore,
+    "board must be unchanged when mutator throws");
+});
+
+// An async mutator that rejects must also propagate without persisting.
+test("REVIEWER update: rejecting async mutator propagates and does not write", async () => {
+  const client = freshClient();
+  const boardBefore = client._store["board"];
+
+  await assert.rejects(
+    () => update(async () => { throw new Error("async-boom"); }, { client }),
+    /async-boom/
+  );
+  assert.strictEqual(client._store["board"], boardBefore,
+    "board must be unchanged when async mutator rejects");
+});
+
+// load() against a totally empty KV (no board, no version) must surface the
+// missing-board error, not silently succeed.
+test("REVIEWER load: empty/missing KV rejects with not-found", async () => {
+  const client = makeMockClient({});
+  await assert.rejects(() => load({ client }), /not found/);
+});
+
+// findTask must tolerate empty epics / empty tasks without throwing.
+test("REVIEWER findTask: tolerates empty epics and empty tasks", () => {
+  const board = {
+    projects: [
+      { id: "p", epics: [] },
+      { id: "q", epics: [{ id: "e", tasks: [] }] },
+    ],
+  };
+  assert.strictEqual(findTask(board, "anything"), null);
+});
