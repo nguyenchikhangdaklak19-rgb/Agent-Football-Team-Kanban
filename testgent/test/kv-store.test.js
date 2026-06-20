@@ -1095,3 +1095,228 @@ test("DECISIVE: atomic-EVAL CAS survives 200 iterations of N=6 concurrent append
   assert.strictEqual(failures, 0,
     "Expected 0 failures across 200 iterations; all " + N + " mutations must survive every run");
 });
+
+// ===========================================================================
+// REVIEWER ADDED: DETERMINISTIC FORCED-INTERLEAVE (the decisive discriminator)
+//
+// WHY THIS EXISTS:
+//   The probabilistic 200-iteration DECISIVE tests above DO NOT actually
+//   discriminate the new EVAL design from the old INCR-then-SET design: under
+//   makeConcurrentBackend (whose load() reads board+version together before any
+//   reserve), the losing TOCTOU schedule never arises naturally from
+//   Promise.all, so a two-round-trip INCR-then-SET update() ALSO passes those
+//   loops with zero lost updates. The reviewer verified this empirically.
+//
+//   To genuinely prove the fix, we PIN the exact losing schedule with a one-shot
+//   gate and run the SAME backend two ways:
+//     (a) a faithful reference oldUpdate() using get/set/incr (two round-trips),
+//     (b) the REAL update() under test using eval() (one atomic round-trip).
+//   We assert (a) loses an update and (b) does not — at the identical gate
+//   point. If a future refactor reverts update() to INCR-then-SET, test (b)
+//   below flips to a lost update and FAILS.
+//
+// THE GATE:
+//   makeGatedBackend pauses the FIRST writer right after its "reserve" step
+//   (incr for old / just-before-eval for new). While paused, a second writer
+//   is run to completion against the same shared state — modelling the
+//   concurrent writer that lands in the TOCTOU window. Then the first writer
+//   resumes and commits.
+// ===========================================================================
+
+function makeGatedBackend(initialBoard, opts) {
+  const state = { board: JSON.stringify(initialBoard), version: 0 };
+  let armed = opts.gate;     // { op, phase } — fire onGate once at this point
+  const onGate = opts.onGate; // async fn(state) run while the first writer pauses
+
+  function maybeGate(op, phase) {
+    if (armed && armed.op === op && armed.phase === phase) {
+      armed = null;
+      return Promise.resolve(onGate ? onGate(state) : undefined);
+    }
+    return Promise.resolve();
+  }
+
+  function client() {
+    return {
+      async get(key) {
+        await Promise.resolve();
+        if (key === "board") return state.board;
+        if (key === "board:version") return String(state.version);
+        return null;
+      },
+      async set(key, value) {
+        await maybeGate("set", "before");
+        await Promise.resolve();
+        if (key === "board") state.board = value;
+      },
+      async incr(key) {
+        await Promise.resolve();
+        if (key === "board:version") {
+          state.version += 1;
+          const result = state.version;
+          await maybeGate("incr", "after"); // pause AFTER the reserve lands
+          return result;
+        }
+        return 1;
+      },
+      // eval — one tick (network RTT), gate fires BEFORE the atomic CAS body,
+      // then CAS executes synchronously (no interleave inside it).
+      async eval(script, keys, args) {
+        await Promise.resolve();
+        await maybeGate("eval", "before");
+        const expected = Number(args[0]);
+        if (state.version !== expected) return [0, state.version];
+        state.board = args[1];
+        state.version += 1;
+        return [1, state.version];
+      },
+    };
+  }
+
+  return { state, client };
+}
+
+// Faithful reference of the OLD broken design, driven through the same client.
+async function oldUpdateReference(mutatorFn, client) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const [board, verRaw] = await Promise.all([
+      client.get("board"),
+      client.get("board:version"),
+    ]);
+    const data = JSON.parse(board);
+    const version = Number(verRaw) || 0;
+    const clone = JSON.parse(JSON.stringify(data));
+    mutatorFn(clone);
+    const next = await client.incr("board:version"); // reserve
+    if (next === version + 1) {
+      await client.set("board", JSON.stringify(clone)); // commit (TOCTOU gap before this)
+      return;
+    }
+  }
+  throw new Error("oldUpdateReference: retries exhausted");
+}
+
+// Control: prove the reference old design LOSES an update at the pinned schedule.
+test("REVIEWER deterministic: reference INCR-then-SET design LOSES an update at the pinned interleave", async () => {
+  let bDone;
+  const backend = makeGatedBackend({ log: [] }, {
+    gate: { op: "incr", phase: "after" }, // pause A right after it reserves the slot
+    onGate: async () => {
+      // While A is paused (reserved version but not yet SET its board),
+      // B runs a complete old-update. B reads the STALE board (A hasn't SET),
+      // B's incr gives version+1 so B "wins", B commits stale+B.
+      bDone = oldUpdateReference((d) => { d.log.push("B"); }, backend.client());
+      await bDone;
+    },
+  });
+
+  await oldUpdateReference((d) => { d.log.push("A"); }, backend.client());
+  if (bDone) await bDone;
+
+  const final = JSON.parse(backend.state.board);
+  // The bug: A's SET lands last and clobbers B's committed write → B is lost.
+  assert.deepStrictEqual(final.log, ["A"],
+    "old design must exhibit a lost update at this schedule (only A survives, B clobbered)");
+});
+
+// THE DISCRIMINATOR: the REAL update() (atomic EVAL) survives the identical schedule.
+test("REVIEWER deterministic: atomic-EVAL update() survives the SAME pinned interleave (no lost update)", async () => {
+  let bDone;
+  const backend = makeGatedBackend({ log: [] }, {
+    gate: { op: "eval", phase: "before" }, // pause A just before its atomic CAS
+    onGate: async () => {
+      // While A is paused before committing, B runs a full real update().
+      bDone = update((d) => { d.log.push("B"); }, { client: backend.client() });
+      await bDone;
+    },
+  });
+
+  await update((d) => { d.log.push("A"); }, { client: backend.client() });
+  if (bDone) await bDone;
+
+  const final = JSON.parse(backend.state.board);
+  const ordered = final.log.slice().sort();
+  // Both mutations must survive: A's stale eval conflicts (B bumped version),
+  // A retries on fresh data and appends on top of B's committed write.
+  assert.deepStrictEqual(ordered, ["A", "B"],
+    "atomic EVAL update() must preserve BOTH mutations at the schedule that breaks INCR-then-SET");
+  assert.strictEqual(backend.state.version, 2,
+    "version must advance once per committed writer (no slot skipped or reused)");
+});
+
+// ---------------------------------------------------------------------------
+// REVIEWER ADDED: version-key-absent first write + version-invariant chain
+// ---------------------------------------------------------------------------
+
+// First write when the version key has never been set (board seeded, version
+// key absent). The CAS_SCRIPT's `GET(version)` returns nil → tonumber(nil) → 0,
+// matching load()'s default of 0, so expected(0) == stored(0) and the write
+// commits, bumping version to 1. No off-by-one, no "key not found".
+test("REVIEWER first-write: update() commits when version key is absent (implicit 0)", async () => {
+  // board present, NO board:version key at all.
+  const client = makeMockClient({ board: JSON.stringify(SAMPLE_BOARD) });
+  assert.strictEqual("board:version" in client._store, false,
+    "precondition: version key must be absent");
+
+  await update((data) => { data._firstEver = true; }, { client });
+
+  const { data, version } = await load({ client });
+  assert.strictEqual(data._firstEver, true, "first-ever write must persist");
+  assert.strictEqual(version, 1,
+    "version must become exactly 1 after the first write (implicit 0 -> 1)");
+});
+
+// The (load V, expect V) invariant must hold across a chain of sequential
+// writers: each write returns newv = V+1, and the NEXT load() reads exactly
+// that, so the following writer's eval(expected=V+1) matches. No drift.
+test("REVIEWER version-invariant: sequential writers each read the prior committed version (no drift)", async () => {
+  const client = freshClient(); // version starts at 0
+  const observedVersions = [];
+
+  for (let i = 0; i < 5; i++) {
+    const { version } = await load({ client });
+    observedVersions.push(version);
+    await update((data) => { data["_w" + i] = true; }, { client });
+  }
+
+  // load saw 0,1,2,3,4 in order — each writer observed exactly the prior commit.
+  assert.deepStrictEqual(observedVersions, [0, 1, 2, 3, 4],
+    "each successive load must read the version left by the previous committed write");
+
+  const { data, version } = await load({ client });
+  assert.strictEqual(version, 5, "five sequential writes leave version at 5");
+  for (let i = 0; i < 5; i++) {
+    assert.strictEqual(data["_w" + i], true, "every sequential write must survive");
+  }
+});
+
+// Conflict-then-successful-retry against the real makeMockClient eval semantics:
+// an interloper bumps the version between our load and our eval, the first eval
+// conflicts, update() reloads fresh data and the second eval commits.
+test("REVIEWER conflict-then-retry: a mid-flight version bump forces one retry, then commits on fresh data", async () => {
+  const client = freshClient();
+  let interloped = false;
+
+  // Wrap eval so the FIRST call sees a version that was bumped out from under us
+  // (interloper committed), forcing a conflict; subsequent calls are normal.
+  const realEval = client.eval.bind(client);
+  client.eval = async (script, keys, args) => {
+    if (!interloped) {
+      interloped = true;
+      // Interloper commits a real write via the mock's own eval at expected=0.
+      const r = await realEval(script, keys, ["0", JSON.stringify(
+        Object.assign(JSON.parse(client._store.board), { _interloper: true })
+      )]);
+      assert.deepStrictEqual(r, [1, 1], "interloper must commit at version 0->1");
+      // Now OUR original eval (expected=0) is stale → must conflict.
+    }
+    return realEval(script, keys, args);
+  };
+
+  await update((data) => { data._mine = true; }, { client });
+
+  const { data, version } = await load({ client });
+  assert.strictEqual(data._interloper, true, "interloper's write must survive");
+  assert.strictEqual(data._mine, true, "our write must survive after the retry");
+  assert.strictEqual(version, 2, "two committed writers leave version at 2");
+});
