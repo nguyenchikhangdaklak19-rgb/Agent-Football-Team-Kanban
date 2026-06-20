@@ -309,3 +309,136 @@ test("package.json: type is commonjs", () => {
   const pkg     = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
   assert.strictEqual(pkg.type, "commonjs", "package.json type must be 'commonjs'");
 });
+
+// ===========================================================================
+// REVIEWER EDGE-CASE TESTS (test(seed): add reviewer edge-case tests)
+// ===========================================================================
+
+// --- R1: overwrite leaves ONLY seed data (no stale keys / merge leftovers) ---
+test("REVIEWER: re-seed overwrites the board key with exactly the new payload", async () => {
+  const client = makeMockClient({});
+
+  // First seed with a board that has an extra epic + task.
+  const firstBoard = JSON.parse(JSON.stringify(SAMPLE_BOARD));
+  firstBoard.projects[0].epics.push({
+    id: "EP-OLD",
+    title: "Stale Epic",
+    tasks: [{ id: "EP-OLD-T1", title: "Stale", status: "backlog" }],
+  });
+  await seedKv({ data: firstBoard, kvOpts: { client } });
+
+  // Second seed with the smaller canonical board.
+  await seedKv({ data: SAMPLE_BOARD, kvOpts: { client } });
+
+  const { data } = await load({ client });
+  // The stale epic must be GONE — overwrite replaces, never merges.
+  assert.deepStrictEqual(data, SAMPLE_BOARD,
+    "re-seed must fully replace the board; no stale data may survive");
+  const epicIds = data.projects[0].epics.map((e) => e.id);
+  assert.ok(!epicIds.includes("EP-OLD"),
+    "stale epic from the first seed must not survive a re-seed");
+});
+
+// --- R2: vercel.json rewrite ORDERING — /api rule precedes the catch-all ---
+test("REVIEWER: vercel.json /api rewrite comes BEFORE the catch-all fallback", () => {
+  const vercelPath = path.resolve(__dirname, "../vercel.json");
+  const config     = JSON.parse(fs.readFileSync(vercelPath, "utf8"));
+  const rewrites   = config.rewrites;
+
+  const apiIdx = rewrites.findIndex(
+    (r) => r.source && r.source.includes("/api/")
+  );
+  const catchAllIdx = rewrites.findIndex(
+    (r) => r.destination && r.destination.includes("index.html")
+  );
+
+  assert.ok(apiIdx >= 0,      "an /api rewrite rule must exist");
+  assert.ok(catchAllIdx >= 0, "a catch-all index.html fallback must exist");
+  assert.ok(apiIdx < catchAllIdx,
+    "the /api/* rewrite must be listed BEFORE the SPA catch-all so the " +
+    "fallback never shadows real API routes");
+});
+
+// --- R3: the SPA catch-all must NOT rewrite API destinations to index.html ---
+test("REVIEWER: the index.html catch-all does not target /api paths", () => {
+  const vercelPath = path.resolve(__dirname, "../vercel.json");
+  const config     = JSON.parse(fs.readFileSync(vercelPath, "utf8"));
+
+  const spaRule = config.rewrites.find(
+    (r) => r.destination && r.destination.includes("index.html")
+  );
+  assert.ok(spaRule, "SPA fallback rewrite must exist");
+  // The catch-all source must not itself be scoped to /api (which would
+  // wrongly funnel API calls into the SPA shell).
+  assert.ok(!(spaRule.source && spaRule.source.startsWith("/api")),
+    "the SPA fallback source must not be an /api path");
+});
+
+// --- R4: no secrets are hardcoded anywhere in vercel.json ---
+test("REVIEWER: vercel.json contains no hardcoded secrets", () => {
+  const vercelPath = path.resolve(__dirname, "../vercel.json");
+  const raw = fs.readFileSync(vercelPath, "utf8");
+  for (const needle of ["KV_REST_API_TOKEN", "BOARD_PASSWORD", "BOARD_SECRET", "Bearer "]) {
+    assert.ok(!raw.includes(needle),
+      "vercel.json must not hardcode secret/credential: " + needle);
+  }
+});
+
+// --- R5: seedKv with NO client and NO env rejects clearly WITHOUT network ---
+test("REVIEWER: seedKv rejects clearly when no client and no env (no network)", async () => {
+  // Block any real network attempt; if seed tries to fetch, this throws a
+  // recognisably different error and the assertion below will catch it.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => { throw new Error("NETWORK ATTEMPTED IN TEST"); };
+
+  const savedUrl   = process.env.KV_REST_API_URL;
+  const savedToken = process.env.KV_REST_API_TOKEN;
+  delete process.env.KV_REST_API_URL;
+  delete process.env.KV_REST_API_TOKEN;
+
+  try {
+    await assert.rejects(
+      () => seedKv({ data: SAMPLE_BOARD }), // no kvOpts.client, no env
+      (err) => {
+        assert.ok(/KV_REST_API_URL|KV_REST_API_TOKEN/.test(err.message),
+          "error must clearly name the missing KV env var, got: " + err.message);
+        assert.ok(!/NETWORK ATTEMPTED/.test(err.message),
+          "seed must fail fast on missing creds, never hit the network");
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedUrl   !== undefined) process.env.KV_REST_API_URL   = savedUrl;
+    if (savedToken !== undefined) process.env.KV_REST_API_TOKEN = savedToken;
+  }
+});
+
+// --- R6: seed bumps version exactly once per call (CAS counter sanity) ---
+test("REVIEWER: each seed call increments the version counter by exactly 1", async () => {
+  const client = makeMockClient({ "board:version": "5" });
+  await seedKv({ data: SAMPLE_BOARD, kvOpts: { client } });
+  assert.strictEqual(Number(client._store["board:version"]), 6,
+    "first seed must take version 5 -> 6");
+  await seedKv({ data: SAMPLE_BOARD, kvOpts: { client } });
+  assert.strictEqual(Number(client._store["board:version"]), 7,
+    "second seed must take version 6 -> 7");
+});
+
+// --- R7: package.json 'test' script string is byte-for-byte unchanged ---
+test("REVIEWER: package.json 'test' script is byte-for-byte the original", () => {
+  const pkgPath = path.resolve(__dirname, "../package.json");
+  const pkg     = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  assert.strictEqual(pkg.scripts.test, "node --test test/*.test.js",
+    "the single-command test runner must remain exactly unchanged");
+});
+
+// --- R8: zero new runtime dependencies were introduced ---
+test("REVIEWER: package.json declares no runtime dependencies (zero-dep)", () => {
+  const pkgPath = path.resolve(__dirname, "../package.json");
+  const pkg     = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const deps = Object.keys(pkg.dependencies || {});
+  assert.deepStrictEqual(deps, [],
+    "task must add no runtime dependencies (kv-store uses global fetch); found: " +
+    JSON.stringify(deps));
+});
