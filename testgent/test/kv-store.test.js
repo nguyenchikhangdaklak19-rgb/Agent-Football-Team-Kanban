@@ -625,3 +625,173 @@ test("REVIEWER findTask: tolerates empty epics and empty tasks", () => {
   };
   assert.strictEqual(findTask(board, "anything"), null);
 });
+
+// ---------------------------------------------------------------------------
+// RE-REVIEW edge cases for the INCR-reserve rework
+// ---------------------------------------------------------------------------
+
+// KEY RISK of reserve-then-write: if INCR succeeds (slot reserved) but the
+// subsequent board SET throws, the version counter is ahead of the board.
+// This must (1) propagate the error to the caller (no silent drop) and (2) NOT
+// permanently brick future writers — a fresh load() reads version == counter,
+// so the next update()'s (load V, reserve V+1) invariant still lines up.
+test("RE-REVIEW update: SET failing after INCR propagates AND does not brick future writes", async () => {
+  let kvBoard = JSON.stringify(SAMPLE_BOARD);
+  let kvVersion = 0;
+  let failNextSet = true;
+
+  const client = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
+      return null;
+    },
+    async set(key, value) {
+      if (key === "board") {
+        if (failNextSet) {
+          failNextSet = false; // only the first board write blows up
+          throw new Error("network blip on SET");
+        }
+        kvBoard = value;
+      }
+    },
+    async incr(key) {
+      if (key === "board:version") { kvVersion += 1; return kvVersion; }
+      return 1;
+    },
+  };
+
+  // First update: mutator succeeds, INCR reserves slot 1, but SET throws.
+  await assert.rejects(
+    () => update((data) => { data._first = true; }, { client }),
+    /network blip on SET/,
+    "a failed board write must propagate, not be silently swallowed"
+  );
+
+  // Version is now 1 (slot was reserved) but board still has no _first marker.
+  assert.strictEqual(kvVersion, 1, "version counter advanced by the reservation");
+  assert.strictEqual(JSON.parse(kvBoard)._first, undefined,
+    "board write did not land (write failed)");
+
+  // Subsequent update must still succeed: it loads version 1, reserves 2 (==1+1),
+  // and writes. The dangling counter did NOT brick the V+1 invariant.
+  await update((data) => { data._second = true; }, { client });
+  const finalBoard = JSON.parse(kvBoard);
+  assert.strictEqual(finalBoard._second, true,
+    "a later update must still commit after an earlier SET failure");
+  assert.strictEqual(kvVersion, 2, "version lines up for the recovering writer");
+});
+
+// A mutator that throws on a LATER call (after an earlier successful update on
+// the same client) must not corrupt state or break the next update. Probes that
+// a throwing mutator reserves NOTHING (mutate happens before incr), so no
+// dangling version is left behind.
+test("RE-REVIEW update: throwing mutator after a prior success leaves state writable", async () => {
+  const client = freshClient();
+
+  // 1) successful update
+  await update((data) => { data._ok = true; }, { client });
+  const versionAfterOk = client._store["board:version"];
+  const boardAfterOk = client._store["board"];
+
+  // 2) update whose mutator throws — must NOT reserve a slot or write
+  await assert.rejects(
+    () => update(() => { throw new Error("late-boom"); }, { client }),
+    /late-boom/
+  );
+  assert.strictEqual(client._store["board:version"], versionAfterOk,
+    "throwing mutator must not bump the version (reserves nothing)");
+  assert.strictEqual(client._store["board"], boardAfterOk,
+    "throwing mutator must not alter the board");
+
+  // 3) a further update must still succeed normally
+  await update((data) => { data._after = true; }, { client });
+  const { data } = await load({ client });
+  assert.strictEqual(data._ok, true, "earlier successful mutation survived");
+  assert.strictEqual(data._after, true, "later update committed cleanly");
+});
+
+// MAX_RETRIES exhaustion must throw a CLEAR error and must NOT silently drop the
+// write. Every attempt's INCR returns a value far past version+1 (permanent
+// conflict). Assert it rejects with the retry-exhaustion message and that the
+// mutator was invoked the bounded number of times (no infinite loop).
+test("RE-REVIEW update: retry exhaustion throws clear error and never silently drops", async () => {
+  let kvBoard = JSON.stringify(SAMPLE_BOARD);
+  let kvVersion = 0;
+  let mutatorCalls = 0;
+
+  const alwaysConflict = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
+      return null;
+    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
+    async incr(key) {
+      if (key === "board:version") {
+        // Always jump 2 ahead so incr() can never equal version+1 → perma-conflict.
+        kvVersion += 2;
+        return kvVersion;
+      }
+      return 1;
+    },
+  };
+
+  await assert.rejects(
+    () => update((data) => { mutatorCalls++; data._never = true; }, { client: alwaysConflict }),
+    /failed after 20 retries/,
+    "exhaustion must surface a clear, bounded-retry error"
+  );
+
+  // Board must never have been written (every attempt conflicted before SET).
+  assert.strictEqual(JSON.parse(kvBoard)._never, undefined,
+    "no board write may leak through on permanent conflict");
+  // Bounded: mutator invoked exactly MAX_RETRIES (20) times, not infinitely.
+  assert.strictEqual(mutatorCalls, 20,
+    "mutator invoked exactly MAX_RETRIES times (bounded retry loop)");
+});
+
+// Direct save() interleaved with update(): save() is an unconditional set+incr
+// escape hatch. Spec routes all /api/move writes through update(), but verify a
+// save() that bumps the version mid-update merely forces a retry (which the
+// update then survives) rather than silently losing the update()'s mutation.
+test("RE-REVIEW save() bumping version mid-update forces a retry, update still survives", async () => {
+  let kvBoard = JSON.stringify({ projects: [], log: [] });
+  let kvVersion = 0;
+  let firstIncr = true;
+
+  const client = {
+    async get(key) {
+      if (key === "board") return kvBoard;
+      if (key === "board:version") return String(kvVersion);
+      return null;
+    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
+    async incr(key) {
+      if (key === "board:version") {
+        if (firstIncr) {
+          firstIncr = false;
+          // Simulate a concurrent direct save() landing between our load and
+          // our reservation: it wrote the board and bumped version to 1.
+          const b = JSON.parse(kvBoard);
+          b.log.push("from-save");
+          kvBoard = JSON.stringify(b);
+          kvVersion = 1;           // save() consumed slot 1
+          kvVersion += 1;          // our incr now returns 2 (!= read-version 0 + 1) → conflict
+          return kvVersion;
+        }
+        kvVersion += 1;
+        return kvVersion;
+      }
+      return 1;
+    },
+  };
+
+  await update((data) => { data.log.push("from-update"); }, { client });
+
+  const finalBoard = JSON.parse(kvBoard);
+  assert.ok(finalBoard.log.includes("from-save"),
+    "the concurrent direct save()'s write must survive");
+  assert.ok(finalBoard.log.includes("from-update"),
+    "the update()'s mutation must survive (retried on top of fresh data)");
+});
