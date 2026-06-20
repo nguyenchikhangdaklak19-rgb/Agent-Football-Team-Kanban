@@ -647,3 +647,221 @@ describe("board.js move — local mode (no remote config)", () => {
     assert.strictEqual(fs.readFileSync(tmp, "utf8"), original, "file must be unchanged");
   });
 });
+
+// ─── reviewer edge-case tests ────────────────────────────────────────────
+//
+// Added by reviewer. These cover gaps the engineer's suite did not exercise:
+// a value-less (boolean true) flag, a successful login that returns no cookie,
+// login OK but move 401 (cookie expired between the two calls), generic 500
+// server errors, non-JSON error bodies, proof that remote config does NOT leak
+// into other CLI commands (list/show/help — guards the top-level `return`), and
+// proof that a remote move leaves the local board-data.json byte-for-byte.
+
+describe("reviewer: isRemoteConfigured / resolveConfig edge cases", () => {
+  test("value-less flag (true) does not count as configured, no env", () => {
+    assert.strictEqual(
+      isRemoteConfigured({ remote: true, password: true, env: {} }),
+      false
+    );
+  });
+
+  test("value-less flag (true) falls through to env", () => {
+    assert.strictEqual(
+      isRemoteConfigured({
+        remote: true,
+        password: true,
+        env: { BOARD_REMOTE: "https://env.example.com", BOARD_PASSWORD: "pw" },
+      }),
+      true
+    );
+  });
+
+  test("resolveConfig ignores value-less flag and uses env", () => {
+    const cfg = resolveConfig({
+      remote: true,
+      password: true,
+      env: { BOARD_REMOTE: "https://env.example.com", BOARD_PASSWORD: "env-pw" },
+    });
+    assert.strictEqual(cfg.url, "https://env.example.com");
+    assert.strictEqual(cfg.password, "env-pw");
+  });
+
+  test("whitespace-only env values are truthy (documents current behavior)", () => {
+    assert.strictEqual(
+      isRemoteConfigured({ env: { BOARD_REMOTE: " ", BOARD_PASSWORD: " " } }),
+      true
+    );
+  });
+});
+
+describe("reviewer: remoteMove additional failure / edge paths", () => {
+  test("login 200 but NO Set-Cookie → move still attempted, no Cookie header", async () => {
+    let moveHeaders = null;
+    const fakeFetch = makeFakeFetch([
+      {
+        match: (url) => url.endsWith("/api/login"),
+        handler: () => fakeResponse({ status: 200, body: { ok: true } }),
+      },
+      {
+        match: (url) => url.endsWith("/api/move"),
+        handler: (_url, init) => {
+          moveHeaders = init.headers;
+          return fakeResponse({ status: 200, body: { ok: true } });
+        },
+      },
+    ]);
+
+    const result = await remoteMove({
+      url: "https://example.vercel.app",
+      password: "pw",
+      id: "T1",
+      to: "progress",
+      by: "engineer",
+      fetch: fakeFetch,
+    });
+
+    assert.strictEqual(result.ok, true);
+    assert.ok(!moveHeaders.Cookie, "no Cookie header expected when login issued none");
+  });
+
+  test("login OK but move returns 401 (cookie expired) → surfaced as error", async () => {
+    const fakeFetch = makeFakeFetch([
+      {
+        match: (url) => url.endsWith("/api/login"),
+        handler: () =>
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+      },
+      {
+        match: (url) => url.endsWith("/api/move"),
+        handler: () => fakeResponse({ status: 401, body: { error: "Token expired" } }),
+      },
+    ]);
+
+    const result = await remoteMove({
+      url: "https://example.vercel.app",
+      password: "pw",
+      id: "T1",
+      to: "progress",
+      by: "engineer",
+      fetch: fakeFetch,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.status, 401);
+    assert.match(result.error, /Token expired|401/);
+  });
+
+  test("move 500 server error → surfaced with non-ok and status 500", async () => {
+    const fakeFetch = makeFakeFetch([
+      {
+        match: (url) => url.endsWith("/api/login"),
+        handler: () =>
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+      },
+      {
+        match: (url) => url.endsWith("/api/move"),
+        handler: () => fakeResponse({ status: 500, body: { error: "KV unavailable" } }),
+      },
+    ]);
+
+    const result = await remoteMove({
+      url: "https://example.vercel.app",
+      password: "pw",
+      id: "T1",
+      to: "progress",
+      by: "engineer",
+      fetch: fakeFetch,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.status, 500);
+    assert.match(result.error, /KV unavailable|500/);
+  });
+
+  test("login non-JSON error body does not crash; error still surfaced", async () => {
+    const fakeFetch = makeFakeFetch([
+      {
+        match: () => true,
+        handler: () => ({
+          ok: false,
+          status: 401,
+          headers: { get: () => null },
+          json: async () => { throw new Error("not json"); },
+        }),
+      },
+    ]);
+
+    const result = await remoteMove({
+      url: "https://example.vercel.app",
+      password: "pw",
+      id: "T1",
+      to: "progress",
+      by: "engineer",
+      fetch: fakeFetch,
+    });
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.status, 401);
+    assert.match(result.error, /401|Login failed/);
+  });
+});
+
+describe("reviewer: CLI remote config must NOT leak to non-move commands", () => {
+  test("list runs locally and prints projects even when remote env is set", () => {
+    const tmp = freshData();
+    const res = runCLI(["list", "--file", tmp], {
+      env: { BOARD_REMOTE: "http://127.0.0.1:1", BOARD_PASSWORD: "x" },
+    });
+    assert.strictEqual(res.code, 0, "list must exit 0, stderr: " + res.stderr);
+    assert.match(res.stdout, /■/, "list must render local project output");
+  });
+
+  test("show runs locally even when remote env is set", () => {
+    const tmp = freshData();
+    const res = runCLI(["show", "EP-1-T4", "--file", tmp], {
+      env: { BOARD_REMOTE: "http://127.0.0.1:1", BOARD_PASSWORD: "x" },
+    });
+    assert.strictEqual(res.code, 0, "show must exit 0, stderr: " + res.stderr);
+    assert.match(res.stdout, /EP-1-T4/);
+  });
+
+  test("help still prints when remote env is set (top-level return regression)", () => {
+    const res = runCLI(["help"], {
+      env: { BOARD_REMOTE: "http://127.0.0.1:1", BOARD_PASSWORD: "x" },
+    });
+    assert.strictEqual(res.code, 0);
+    assert.match(res.stdout, /board/);
+  });
+});
+
+describe("reviewer: remote move must NOT touch the local file", () => {
+  test("successful remote move leaves local --file byte-for-byte unchanged", async () => {
+    const tmp = freshData();
+    const before = fs.readFileSync(tmp, "utf8");
+
+    const stub = await startStubServer({
+      loginStatus: 200,
+      loginBody: { ok: true },
+      loginCookie: "token=t; Path=/",
+      moveStatus: 200,
+      moveBody: { ok: true },
+    });
+
+    try {
+      const res = await runCLIAsync(
+        ["move", "EP-1-T4", "test", "--by", "engineer", "--file", tmp],
+        { env: { BOARD_REMOTE: stub.url, BOARD_PASSWORD: "pw" } }
+      );
+      assert.strictEqual(res.code, 0, "expected exit 0, stderr: " + res.stderr);
+      assert.match(res.stdout, /remote/);
+    } finally {
+      await stub.close();
+    }
+
+    assert.strictEqual(
+      fs.readFileSync(tmp, "utf8"),
+      before,
+      "remote move must NOT write the local file"
+    );
+  });
+});
