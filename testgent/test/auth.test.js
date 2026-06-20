@@ -359,3 +359,243 @@ test("serializeCookie: COOKIE_NAME constant works as the cookie name", () => {
   const str = serializeCookie(COOKIE_NAME, "tok123", { httpOnly: true, path: "/" });
   assert.ok(str.startsWith(COOKIE_NAME + "=tok123"));
 });
+
+// ===========================================================================
+// REVIEWER edge-case tests (test(auth): add reviewer edge-case tests)
+// ===========================================================================
+
+// --- checkPassword: timingSafeEqual length-mismatch must never throw --------
+
+test("[reviewer] checkPassword: length mismatch never throws (timingSafeEqual guard)", () => {
+  // crypto.timingSafeEqual throws on unequal buffer lengths; the impl must guard.
+  assert.doesNotThrow(() => checkPassword("a", "abcdefghijklmnop"));
+  assert.doesNotThrow(() => checkPassword("abcdefghijklmnop", "a"));
+  assert.strictEqual(checkPassword("a", "abcdefghijklmnop"), false);
+  assert.strictEqual(checkPassword("abcdefghijklmnop", "a"), false);
+});
+
+test("[reviewer] checkPassword: many non-string types return false without throwing", () => {
+  for (const bad of [undefined, null, 0, 1, {}, [], true, false, NaN, () => {}]) {
+    assert.doesNotThrow(() => checkPassword(bad, "x"));
+    assert.doesNotThrow(() => checkPassword("x", bad));
+    assert.strictEqual(checkPassword(bad, "x"), false);
+    assert.strictEqual(checkPassword("x", bad), false);
+  }
+});
+
+test("[reviewer] checkPassword: unicode of differing byte-length returns false safely", () => {
+  // 'é' is 2 bytes in UTF-8, 'e' is 1 — Buffer lengths differ.
+  assert.doesNotThrow(() => checkPassword("é", "e"));
+  assert.strictEqual(checkPassword("é", "e"), false);
+});
+
+// --- verifyToken: malformed input must return {valid:false}, never throw ----
+
+test("[reviewer] verifyToken: garbage/malformed tokens never throw", () => {
+  const SAMPLES = [
+    "",
+    ".",
+    "..",
+    "a.b.c",
+    "justonepart",
+    ".onlysig",
+    "onlyheader.",
+    "@@@@.@@@@",        // chars outside base64url alphabet
+    "   .   ",
+    "%%%.###",
+    "a".repeat(10000) + "." + "b".repeat(10000), // large junk
+  ];
+  for (const tok of SAMPLES) {
+    assert.doesNotThrow(() => verifyToken(tok, SECRET, { now: nowFn }), `threw on: ${tok.slice(0, 20)}`);
+    const r = verifyToken(tok, SECRET, { now: nowFn });
+    assert.strictEqual(r.valid, false, `should be invalid: ${tok.slice(0, 20)}`);
+  }
+});
+
+test("[reviewer] verifyToken: non-string token types never throw, return invalid", () => {
+  for (const bad of [null, undefined, 0, 123, {}, [], true]) {
+    assert.doesNotThrow(() => verifyToken(bad, SECRET, { now: nowFn }));
+    assert.strictEqual(verifyToken(bad, SECRET, { now: nowFn }).valid, false);
+  }
+});
+
+test("[reviewer] verifyToken: base64url payload that is valid JSON but not an object", () => {
+  // JSON number, string, array, null all decode to non-{} — must be rejected.
+  const enc = (s) =>
+    Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const crypto = require("node:crypto");
+  for (const raw of ["123", '"hello"', "[1,2,3]", "null", "true"]) {
+    const h = enc(raw);
+    const sig = crypto
+      .createHmac("sha256", SECRET)
+      .update(h)
+      .digest()
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    assert.doesNotThrow(() => verifyToken(h + "." + sig, SECRET, { now: nowFn }));
+    const r = verifyToken(h + "." + sig, SECRET, { now: nowFn });
+    assert.strictEqual(r.valid, false, `non-object JSON payload accepted: ${raw}`);
+  }
+});
+
+test("[reviewer] verifyToken: correctly-signed payload missing exp is rejected", () => {
+  const enc = (s) =>
+    Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const crypto = require("node:crypto");
+  const h = enc(JSON.stringify({ role: "po" })); // no exp
+  const sig = crypto
+    .createHmac("sha256", SECRET)
+    .update(h)
+    .digest()
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const r = verifyToken(h + "." + sig, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, false);
+  assert.match(r.reason, /exp/);
+});
+
+test("[reviewer] verifyToken: exp present but non-numeric (string) is rejected", () => {
+  const enc = (s) =>
+    Buffer.from(s).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const crypto = require("node:crypto");
+  const h = enc(JSON.stringify({ exp: "9999999999" })); // string, not number
+  const sig = crypto
+    .createHmac("sha256", SECRET)
+    .update(h)
+    .digest()
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const r = verifyToken(h + "." + sig, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, false);
+});
+
+// --- verifyToken: signature must cover the payload (no swap / forgery) ------
+
+test("[reviewer] verifyToken: cannot extend expiry by editing payload + reusing old signature", () => {
+  const ttl = 60;
+  const token = signToken({ role: "po" }, SECRET, { now: nowFn, ttl });
+  const [h, s] = token.split(".");
+  // Decode payload, push exp far into the future, re-encode, keep ORIGINAL signature.
+  const decoded = JSON.parse(
+    Buffer.from(h.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")
+  );
+  decoded.exp = 9_999_999_999;
+  const forgedH = Buffer.from(JSON.stringify(decoded))
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  const r = verifyToken(forgedH + "." + s, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, false, "forged extended-expiry token must be rejected");
+  assert.strictEqual(r.reason, "bad signature");
+});
+
+test("[reviewer] verifyToken: cannot swap payload of token A onto signature of token B", () => {
+  const tokenA = signToken({ role: "engineer" }, SECRET, { now: nowFn });
+  const tokenB = signToken({ role: "po" }, SECRET, { now: nowFn });
+  const headerA = tokenA.split(".")[0];
+  const sigB = tokenB.split(".")[1];
+  const r = verifyToken(headerA + "." + sigB, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, false);
+  assert.strictEqual(r.reason, "bad signature");
+});
+
+test("[reviewer] verifyToken: appending base64url char to header invalidates signature", () => {
+  const token = signToken({ role: "po" }, SECRET, { now: nowFn });
+  const [h, s] = token.split(".");
+  const r = verifyToken(h + "A." + s, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, false);
+});
+
+test("[reviewer] verifyToken: empty signature part is rejected without throwing", () => {
+  const token = signToken({ role: "po" }, SECRET, { now: nowFn });
+  const h = token.split(".")[0];
+  assert.doesNotThrow(() => verifyToken(h + ".", SECRET, { now: nowFn }));
+  assert.strictEqual(verifyToken(h + ".", SECRET, { now: nowFn }).valid, false);
+});
+
+// --- signToken: caller cannot pre-seed iat/exp to forge a longer life ------
+
+test("[reviewer] signToken: caller-supplied exp/iat are overwritten by the signer", () => {
+  const token = signToken(
+    { role: "po", exp: 9_999_999_999, iat: 0 },
+    SECRET,
+    { now: nowFn, ttl: 100 }
+  );
+  const r = verifyToken(token, SECRET, { now: nowFn });
+  assert.strictEqual(r.valid, true);
+  assert.strictEqual(r.payload.iat, FIXED_NOW);
+  assert.strictEqual(r.payload.exp, FIXED_NOW + 100);
+});
+
+// --- parseCookies: more robustness -----------------------------------------
+
+test("[reviewer] parseCookies: trailing/leading/empty segments are skipped", () => {
+  const r = parseCookies("a=1;; ;b=2;");
+  assert.deepStrictEqual(r, { a: "1", b: "2" });
+});
+
+test("[reviewer] parseCookies: duplicate cookie names — last value wins", () => {
+  const r = parseCookies("a=1; a=2; a=3");
+  assert.strictEqual(r["a"], "3");
+});
+
+test("[reviewer] parseCookies: empty value is preserved", () => {
+  const r = parseCookies("a=; b=2");
+  assert.strictEqual(r["a"], "");
+  assert.strictEqual(r["b"], "2");
+});
+
+test("[reviewer] parseCookies: realistic header with HMAC token containing dots and '='", () => {
+  const token = signToken({ role: "po" }, SECRET, { now: nowFn });
+  const header = `${COOKIE_NAME}=${token}; other=1`;
+  const r = parseCookies(header);
+  assert.strictEqual(r[COOKIE_NAME], token, "full token must round-trip through cookie parse");
+  assert.strictEqual(verifyToken(r[COOKIE_NAME], SECRET, { now: nowFn }).valid, true);
+});
+
+// --- serializeCookie -> parseCookies round-trip & hardened session cookie ---
+
+test("[reviewer] serializeCookie produces a hardened session cookie (HttpOnly + SameSite + Secure)", () => {
+  const token = signToken({ role: "po" }, SECRET, { now: nowFn });
+  const setCookie = serializeCookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Strict",
+    path: "/",
+    maxAge: 28800,
+  });
+  assert.ok(/(^|; )HttpOnly(;|$)/.test(setCookie), "HttpOnly directive present");
+  assert.ok(/SameSite=Strict/.test(setCookie), "SameSite=Strict present");
+  assert.ok(/(^|; )Secure(;|$)/.test(setCookie), "Secure present");
+  // The name=value portion (before the first '; ') must parse back to the token.
+  const nameValue = setCookie.split("; ")[0];
+  const parsed = parseCookies(nameValue);
+  assert.strictEqual(parsed[COOKIE_NAME], token);
+});
+
+test("[reviewer] serializeCookie: Max-Age=0 (expire/clear cookie) is emitted", () => {
+  const str = serializeCookie(COOKIE_NAME, "", { maxAge: 0, path: "/" });
+  assert.ok(str.includes("Max-Age=0"), "Max-Age=0 must be emitted to clear a cookie");
+});
+
+test("[reviewer] serializeCookie: fractional Max-Age is floored to an integer", () => {
+  const str = serializeCookie("x", "y", { maxAge: 3600.9 });
+  assert.ok(str.includes("Max-Age=3600"), "Max-Age must be an integer");
+});
+
+// --- no hardcoded secret: token signed under one secret fails under another -
+
+test("[reviewer] secret is caller-supplied: same payload under two secrets yields different, non-cross-valid tokens", () => {
+  const t1 = signToken({ role: "po" }, "secret-one", { now: nowFn });
+  const t2 = signToken({ role: "po" }, "secret-two", { now: nowFn });
+  assert.notStrictEqual(t1, t2, "different secrets must produce different signatures");
+  assert.strictEqual(verifyToken(t1, "secret-two", { now: nowFn }).valid, false);
+  assert.strictEqual(verifyToken(t2, "secret-one", { now: nowFn }).valid, false);
+});
