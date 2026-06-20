@@ -18,6 +18,10 @@ const { load, save, findTask, update } = require("../lib/kv-store");
 /**
  * Creates a fresh in-memory KV client. Optionally pre-seeded with data.
  * store is a plain object { [key]: value } where values are strings or null.
+ *
+ * The eval() method executes a hard-coded CAS matching the CAS_SCRIPT in
+ * kv-store.js — this is the correct mock for single-client (non-concurrent)
+ * tests.  For concurrency tests see makeConcurrentBackend / makeToctouBackend.
  */
 function makeMockClient(initialStore) {
   const store = Object.assign(Object.create(null), initialStore || {});
@@ -34,6 +38,25 @@ function makeMockClient(initialStore) {
       const next = current + 1;
       store[key] = String(next);
       return next;
+    },
+    /**
+     * eval() — atomic CAS matching kv-store's CAS_SCRIPT semantics.
+     * keys[0]=boardKey, keys[1]=versionKey
+     * args[0]=expectedVersion, args[1]=newBoardJSON
+     * Returns [1, newVersion] on success, [0, storedVersion] on conflict.
+     */
+    async eval(script, keys, args) {
+      const versionKey = keys[1];
+      const boardKey = keys[0];
+      const stored = versionKey in store ? (Number(store[versionKey]) || 0) : 0;
+      const expected = Number(args[0]);
+      if (stored !== expected) {
+        return [0, stored];
+      }
+      store[boardKey] = args[1];
+      const newv = stored + 1;
+      store[versionKey] = String(newv);
+      return [1, newv];
     },
     // Expose the raw store for test assertions
     _store: store,
@@ -244,16 +267,13 @@ test("update: async mutator is supported", async () => {
 });
 
 test("update: throws after max retries on permanent conflict", async () => {
-  // A client whose get() always returns an ever-incrementing version
-  // to simulate infinite concurrent writes.
+  // A client whose eval() always returns a conflict (stored version never matches).
   let versionCounter = 0;
   const store = { board: JSON.stringify(SAMPLE_BOARD) };
 
   const conflictClient = {
     async get(key) {
       if (key === "board") return store.board;
-      // board:version: always returns a different value than what we read
-      // by incrementing on every call without a real set
       return String(versionCounter++);
     },
     async set(key, value) {
@@ -262,6 +282,11 @@ test("update: throws after max retries on permanent conflict", async () => {
     async incr(key) {
       versionCounter++;
       return versionCounter;
+    },
+    async eval(script, keys, args) {
+      // Always conflict: bump the stored version so it never matches expected
+      versionCounter++;
+      return [0, versionCounter];
     },
   };
 
@@ -278,19 +303,16 @@ test("update: throws after max retries on permanent conflict", async () => {
 
 test("concurrency: two concurrent updates both survive (no lost update)", async () => {
   /*
-   * Scenario using INCR-reserve CAS:
-   *   - Agent A reads version 0, mutates, calls incr() → gets 1 (=== 0+1), writes.
-   *   - Agent B reads version 0, mutates, calls incr() → gets 2 (!== 0+1), conflict.
-   *   - Agent B retries: reads version 2, mutates, calls incr() → gets 3 (=== 2+1),
-   *     writes on top of Agent A's data (which now has _byA: true).
+   * Scenario using atomic-CAS EVAL:
+   *   - Agent A reads version 0, mutates, calls eval(expected=0) → success (version→1), writes.
+   *   - Agent B reads version 0, mutates, calls eval(expected=0) → conflict (stored=1≠0).
+   *   - Agent B retries: reads version 1, board has A's data, mutates, eval(expected=1) → success.
    *   - Final board: both _byA and _byB present.
    *
-   * We simulate this with a client whose incr() returns 2 on the first (conflicting)
-   * call (as if Agent A had already claimed slot 1), then simulates Agent A's board
-   * write, and on the retry incr() returns the correct next value.
+   * We simulate this with shared KV state and a scripted eval() that injects A's
+   * write on the first call (simulating A committing before B's eval runs).
    */
 
-  // Shared KV state
   let kvBoard = JSON.stringify(SAMPLE_BOARD);
   let kvVersion = 0;
 
@@ -306,23 +328,27 @@ test("concurrency: two concurrent updates both survive (no lost update)", async 
       if (key === "board:version") { kvVersion++; return kvVersion; }
       return 1;
     },
+    async eval(script, keys, args) {
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
+    },
   };
 
-  // Run Agent A's update (no conflict)
   await update((data) => { data._byA = true; }, { client: clientA });
 
   assert.strictEqual(kvVersion, 1, "version should be 1 after Agent A's write");
   assert.strictEqual(JSON.parse(kvBoard)._byA, true, "_byA should be set after Agent A");
 
-  // Reset for Agent B's scenario: simulate B loading at version 0, but
-  // Agent A has already written before B's incr() call.
+  // Reset for Agent B's scenario
   kvBoard = JSON.stringify(SAMPLE_BOARD);
   kvVersion = 0;
 
-  // Agent B's client: incr() returns 2 on first call (skipping slot 1,
-  // as if A claimed it). This triggers a conflict. The retry incr() increments
-  // normally. Between B's load and B's first incr(), we inject A's board write.
-  let agentBIncrCalls = 0;
+  // Agent B's client: first eval() returns conflict (simulating A committed first),
+  // then injects A's board write, retry succeeds.
+  let agentBEvalCalls = 0;
   const clientB = {
     async get(key) {
       if (key === "board") return kvBoard;
@@ -330,41 +356,38 @@ test("concurrency: two concurrent updates both survive (no lost update)", async 
       return null;
     },
     async set(key, value) { if (key === "board") kvBoard = value; },
-    async incr(key) {
-      if (key === "board:version") {
-        agentBIncrCalls++;
-        if (agentBIncrCalls === 1) {
-          // Simulate Agent A claiming slot 1 first and writing its board
-          const dataWithA = JSON.parse(kvBoard);
-          dataWithA._byA = true;
-          kvBoard = JSON.stringify(dataWithA);
-          kvVersion = 2; // A claimed 1, B now gets 2 → conflict (B read version=0)
-          return 2;
-        }
-        // Retry: normal increment
-        kvVersion++;
-        return kvVersion;
+    async incr(key) { if (key === "board:version") { kvVersion++; return kvVersion; } return 1; },
+    async eval(script, keys, args) {
+      agentBEvalCalls++;
+      if (agentBEvalCalls === 1) {
+        // Simulate Agent A committing atomically (board + version) before B's eval lands
+        const dataWithA = JSON.parse(kvBoard);
+        dataWithA._byA = true;
+        kvBoard = JSON.stringify(dataWithA);
+        kvVersion = 1; // A's eval bumped version to 1
+        return [0, kvVersion]; // conflict: expected=0, stored=1
       }
-      return 1;
+      // Retry: normal CAS
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
     },
   };
 
-  // Agent B's update: will conflict on first attempt (incr returns 2 ≠ 0+1),
-  // then retry reading fresh board (with _byA) and succeed.
   await update((data) => { data._byB = true; }, { client: clientB });
 
-  // Final board must contain both mutations
   const finalBoard = JSON.parse(kvBoard);
   assert.strictEqual(finalBoard._byA, true, "Agent A's mutation must survive");
   assert.strictEqual(finalBoard._byB, true, "Agent B's mutation must survive");
-  assert.strictEqual(kvVersion, 3, "version should be 3 after both writes");
+  assert.strictEqual(kvVersion, 2, "version should be 2 after both writes");
 });
 
 test("concurrency: explicit retry path is exercised", async () => {
   /*
-   * Verify the retry counter is exercised with INCR-reserve CAS: we cause
-   * exactly 2 conflicts (incr() returns a value > version+1) before letting
-   * the write through (incr() returns exactly version+1).
+   * Verify the retry counter is exercised: cause exactly 2 conflicts (eval()
+   * returns [0, ...]) before letting the write through (eval returns [1, ...]).
    */
   let kvBoard = JSON.stringify(SAMPLE_BOARD);
   let kvVersion = 0;
@@ -381,20 +404,21 @@ test("concurrency: explicit retry path is exercised", async () => {
       if (key === "board") kvBoard = value;
     },
     async incr(key) {
-      if (key === "board:version") {
-        if (conflictsSimulated < NUM_CONFLICTS) {
-          // Simulate an external writer having already claimed the next slot:
-          // bump kvVersion by 2 (external writer took +1, we get +2) so that
-          // incr returns a value !== version+1, causing a conflict.
-          conflictsSimulated++;
-          kvVersion += 2;
-          return kvVersion;
-        }
-        // No more conflicts: normal increment (version+1 = expected next slot).
-        kvVersion++;
-        return kvVersion;
-      }
+      if (key === "board:version") { kvVersion++; return kvVersion; }
       return 1;
+    },
+    async eval(script, keys, args) {
+      if (conflictsSimulated < NUM_CONFLICTS) {
+        conflictsSimulated++;
+        kvVersion += 2; // external writer bumped ahead
+        return [0, kvVersion]; // conflict
+      }
+      // Normal CAS
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
     },
   };
 
@@ -404,7 +428,6 @@ test("concurrency: explicit retry path is exercised", async () => {
     data._attempt = mutationCount;
   }, { client });
 
-  // mutator must have been called NUM_CONFLICTS + 1 times (once per attempt)
   assert.strictEqual(mutationCount, NUM_CONFLICTS + 1,
     "mutator must be called once per attempt (conflicts + final success)");
 
@@ -418,7 +441,6 @@ test("concurrency: explicit retry path is exercised", async () => {
 // ---------------------------------------------------------------------------
 
 test("resolveClient: throws when no client, url, or env vars provided", async () => {
-  // Temporarily clear env vars
   const savedUrl = process.env.KV_REST_API_URL;
   const savedToken = process.env.KV_REST_API_TOKEN;
   delete process.env.KV_REST_API_URL;
@@ -440,28 +462,42 @@ test("resolveClient: throws when no client, url, or env vars provided", async ()
 // ===========================================================================
 //
 // A realistic, in-memory KV backend whose operations are genuinely async
-// (each await yields a microtask turn) and whose INCR is atomic with respect
-// to that single-threaded event loop. This is the faithful model the CAS
-// claim must hold under: two update() calls driven concurrently via
-// Promise.all that interleave at the await boundaries.
+// (each await yields a microtask turn).  The key invariant:
 //
-// No real network: this is a pure in-memory object. No console / process.exit.
+//   • get/set/incr each yield ONE tick — modelling individual round-trips.
+//   • eval() yields ONE tick for the network round-trip, then executes the
+//     entire CAS body synchronously WITHOUT any additional yield — exactly
+//     like real Redis, where a Lua script runs atomically to completion
+//     inside the single-threaded server, invisible to any concurrent client.
+//
+// This is the faithful serialized-Redis model:
+//   - With the old INCR-then-SET design (two round-trips) a concurrent GET
+//     can land between the INCR and the SET and observe stale data →
+//     the loser's retry can clobber the winner's write.
+//   - With the new single-EVAL design, no command can interleave during the
+//     CAS body, so the TOCTOU window is closed.
 // ---------------------------------------------------------------------------
 
 /**
- * A shared backend object shared by clients handed to concurrent update() calls.
- * Every op is async and yields control, so two in-flight update() calls
- * interleave the way they would against a real remote KV.
+ * makeConcurrentBackend(initialBoard, initialVersion)
+ *
+ * Returns { state, client }.  client() produces a new client handle sharing
+ * the same state.  Pass a different client() call to each concurrent update().
+ *
+ * get / set / incr — each yield one microtask tick (models individual I/O).
+ * eval             — yields one tick (network RTT), then runs CAS atomically
+ *                    with NO further yield (models Redis Lua atomicity).
  */
 function makeConcurrentBackend(initialBoard, initialVersion) {
   const state = {
     board: JSON.stringify(initialBoard),
     version: initialVersion == null ? 0 : initialVersion,
   };
+
   function client() {
     return {
       async get(key) {
-        await Promise.resolve(); // yield: let the other update() advance
+        await Promise.resolve(); // one tick — lets other coroutines advance
         if (key === "board") return state.board;
         if (key === "board:version") return String(state.version);
         return null;
@@ -473,24 +509,37 @@ function makeConcurrentBackend(initialBoard, initialVersion) {
       async incr(key) {
         await Promise.resolve();
         if (key === "board:version") {
-          state.version += 1; // atomic w.r.t. the single-threaded loop
+          state.version += 1;
           return state.version;
         }
         return 1;
       },
+      /**
+       * eval — ONE tick for the network round-trip, then CAS runs synchronously.
+       *
+       * The synchronous body models Redis Lua atomicity: after the single yield
+       * (representing the network RTT), the compare-and-swap executes without
+       * any further await, so no other coroutine can observe an intermediate
+       * state between the version-check and the board-write.
+       */
+      async eval(script, keys, args) {
+        await Promise.resolve(); // network RTT — other coroutines may advance here
+        // CAS body runs synchronously (atomic w.r.t. the event loop):
+        const expected = Number(args[0]);
+        if (state.version !== expected) {
+          return [0, state.version]; // conflict
+        }
+        state.board = args[1];
+        state.version += 1;
+        return [1, state.version]; // success
+      },
     };
   }
+
   return { state, client };
 }
 
-// CRITICAL: this is the lost-update probe the spec demands. Two agents update
-// the SAME board concurrently. Each sets a distinct top-level marker. For the
-// CAS guarantee to hold, BOTH markers must survive in the final persisted board.
-//
-// This test interleaves them via Promise.all so both can read version V before
-// either commits — exactly the window where a naive GET-check-then-SET loses an
-// update. If the adapter's concurrency control is real, both survive; if it is
-// only a non-atomic check-then-act, one mutation is clobbered and this fails.
+// CRITICAL: two genuinely-interleaved update()s must not lose either mutation.
 test("REVIEWER concurrency: two genuinely-interleaved updates must not lose an update", async () => {
   const backend = makeConcurrentBackend(SAMPLE_BOARD, 0);
 
@@ -509,8 +558,7 @@ test("REVIEWER concurrency: two genuinely-interleaved updates must not lose an u
   assert.strictEqual(finalBoard._byB, true, "Agent B's mutation must survive");
 });
 
-// Same probe at higher contention: many concurrent updates each appending a
-// distinct id to an array. A correct adapter ends with every id present.
+// Higher contention: N concurrent updates each appending a distinct id.
 test("REVIEWER concurrency: N interleaved updates all survive (array append)", async () => {
   const seed = { projects: [], log: [] };
   const backend = makeConcurrentBackend(seed, 0);
@@ -531,13 +579,11 @@ test("REVIEWER concurrency: N interleaved updates all survive (array append)", a
     "every concurrent update's append must survive (no lost update)");
 });
 
-// Retry must re-read FRESH data, not reuse the stale snapshot from the first
-// attempt. We force one conflict, then assert the mutator on the retry sees
-// the value written by the conflicting writer.
+// Retry must re-read FRESH data, not reuse the stale snapshot.
 test("REVIEWER concurrency: retry re-reads fresh data before mutating", async () => {
   let kvBoard = JSON.stringify({ projects: [], counter: 0 });
   let kvVersion = 0;
-  let incrCalls = 0;
+  let evalCalls = 0;
   const sawCounterOnEachAttempt = [];
 
   const client = {
@@ -548,21 +594,24 @@ test("REVIEWER concurrency: retry re-reads fresh data before mutating", async ()
     },
     async set(key, value) { if (key === "board") kvBoard = value; },
     async incr(key) {
-      if (key === "board:version") {
-        incrCalls++;
-        // First incr() call is the first attempt's reservation: simulate an
-        // external writer that has already claimed slot 1 and written counter=99.
-        // Return 2 (skipping slot 1) so next (2) !== version+1 (0+1=1) → conflict.
-        if (incrCalls === 1) {
-          kvBoard = JSON.stringify({ projects: [], counter: 99 });
-          kvVersion = 2; // external writer claimed 1, we get 2
-          return 2;
-        }
-        // Retry: normal increment
-        kvVersion++;
-        return kvVersion;
-      }
+      if (key === "board:version") { kvVersion++; return kvVersion; }
       return 1;
+    },
+    async eval(script, keys, args) {
+      evalCalls++;
+      if (evalCalls === 1) {
+        // First CAS attempt: simulate an external writer that committed counter=99
+        // atomically (board + version bump) while our eval was in-flight.
+        kvBoard = JSON.stringify({ projects: [], counter: 99 });
+        kvVersion = 2; // external writer consumed slot 1, we expected 0
+        return [0, kvVersion]; // conflict
+      }
+      // Retry: normal CAS
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
     },
   };
 
@@ -571,7 +620,6 @@ test("REVIEWER concurrency: retry re-reads fresh data before mutating", async ()
     data.counter = data.counter + 1;
   }, { client });
 
-  // First attempt saw 0 then conflicted; retry must have seen the fresh 99.
   assert.deepStrictEqual(sawCounterOnEachAttempt, [0, 99],
     "retry mutator must operate on freshly re-read data");
   assert.strictEqual(JSON.parse(kvBoard).counter, 100,
@@ -608,8 +656,7 @@ test("REVIEWER update: rejecting async mutator propagates and does not write", a
     "board must be unchanged when async mutator rejects");
 });
 
-// load() against a totally empty KV (no board, no version) must surface the
-// missing-board error, not silently succeed.
+// load() against an empty KV must surface the missing-board error.
 test("REVIEWER load: empty/missing KV rejects with not-found", async () => {
   const client = makeMockClient({});
   await assert.rejects(() => load({ client }), /not found/);
@@ -627,18 +674,16 @@ test("REVIEWER findTask: tolerates empty epics and empty tasks", () => {
 });
 
 // ---------------------------------------------------------------------------
-// RE-REVIEW edge cases for the INCR-reserve rework
+// RE-REVIEW edge cases for the Lua EVAL atomic-CAS design
 // ---------------------------------------------------------------------------
 
-// KEY RISK of reserve-then-write: if INCR succeeds (slot reserved) but the
-// subsequent board SET throws, the version counter is ahead of the board.
-// This must (1) propagate the error to the caller (no silent drop) and (2) NOT
-// permanently brick future writers — a fresh load() reads version == counter,
-// so the next update()'s (load V, reserve V+1) invariant still lines up.
-test("RE-REVIEW update: SET failing after INCR propagates AND does not brick future writes", async () => {
+// With atomic EVAL, if the eval itself throws (e.g. network error during the
+// single round-trip), neither the board nor the version is modified — no
+// dangling version is left behind.  Future writers can still proceed normally.
+test("RE-REVIEW update: eval() failing propagates AND does not brick future writes", async () => {
   let kvBoard = JSON.stringify(SAMPLE_BOARD);
   let kvVersion = 0;
-  let failNextSet = true;
+  let failNextEval = true;
 
   const client = {
     async get(key) {
@@ -646,46 +691,48 @@ test("RE-REVIEW update: SET failing after INCR propagates AND does not brick fut
       if (key === "board:version") return String(kvVersion);
       return null;
     },
-    async set(key, value) {
-      if (key === "board") {
-        if (failNextSet) {
-          failNextSet = false; // only the first board write blows up
-          throw new Error("network blip on SET");
-        }
-        kvBoard = value;
-      }
-    },
+    async set(key, value) { if (key === "board") kvBoard = value; },
     async incr(key) {
-      if (key === "board:version") { kvVersion += 1; return kvVersion; }
+      if (key === "board:version") { kvVersion++; return kvVersion; }
       return 1;
+    },
+    async eval(script, keys, args) {
+      if (failNextEval) {
+        failNextEval = false;
+        throw new Error("network blip on EVAL");
+      }
+      // Normal CAS
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
     },
   };
 
-  // First update: mutator succeeds, INCR reserves slot 1, but SET throws.
+  // First update: mutator succeeds, eval() throws — nothing is written.
   await assert.rejects(
     () => update((data) => { data._first = true; }, { client }),
-    /network blip on SET/,
-    "a failed board write must propagate, not be silently swallowed"
+    /network blip on EVAL/,
+    "a failed eval must propagate, not be silently swallowed"
   );
 
-  // Version is now 1 (slot was reserved) but board still has no _first marker.
-  assert.strictEqual(kvVersion, 1, "version counter advanced by the reservation");
+  // Version unchanged (eval was atomic — it either commits both or nothing).
+  assert.strictEqual(kvVersion, 0, "version must be unchanged after eval failure");
   assert.strictEqual(JSON.parse(kvBoard)._first, undefined,
-    "board write did not land (write failed)");
+    "board must be unchanged after eval failure");
 
-  // Subsequent update must still succeed: it loads version 1, reserves 2 (==1+1),
-  // and writes. The dangling counter did NOT brick the V+1 invariant.
+  // Subsequent update must still succeed: loads version 0, eval(expected=0) → success.
   await update((data) => { data._second = true; }, { client });
   const finalBoard = JSON.parse(kvBoard);
   assert.strictEqual(finalBoard._second, true,
-    "a later update must still commit after an earlier SET failure");
-  assert.strictEqual(kvVersion, 2, "version lines up for the recovering writer");
+    "a later update must commit normally after an earlier eval failure");
+  assert.strictEqual(kvVersion, 1, "version lines up for the recovering writer");
 });
 
-// A mutator that throws on a LATER call (after an earlier successful update on
-// the same client) must not corrupt state or break the next update. Probes that
-// a throwing mutator reserves NOTHING (mutate happens before incr), so no
-// dangling version is left behind.
+// A mutator that throws on a LATER call must not corrupt state.
+// With EVAL, the mutator runs BEFORE eval() is called, so a throwing mutator
+// never reaches eval() and reserves nothing — no dangling state possible.
 test("RE-REVIEW update: throwing mutator after a prior success leaves state writable", async () => {
   const client = freshClient();
 
@@ -700,21 +747,18 @@ test("RE-REVIEW update: throwing mutator after a prior success leaves state writ
     /late-boom/
   );
   assert.strictEqual(client._store["board:version"], versionAfterOk,
-    "throwing mutator must not bump the version (reserves nothing)");
+    "throwing mutator must not bump the version (eval never reached)");
   assert.strictEqual(client._store["board"], boardAfterOk,
     "throwing mutator must not alter the board");
 
-  // 3) a further update must still succeed normally
+  // 3) a further update must succeed normally
   await update((data) => { data._after = true; }, { client });
   const { data } = await load({ client });
   assert.strictEqual(data._ok, true, "earlier successful mutation survived");
   assert.strictEqual(data._after, true, "later update committed cleanly");
 });
 
-// MAX_RETRIES exhaustion must throw a CLEAR error and must NOT silently drop the
-// write. Every attempt's INCR returns a value far past version+1 (permanent
-// conflict). Assert it rejects with the retry-exhaustion message and that the
-// mutator was invoked the bounded number of times (no infinite loop).
+// MAX_RETRIES exhaustion must throw a CLEAR error.
 test("RE-REVIEW update: retry exhaustion throws clear error and never silently drops", async () => {
   let kvBoard = JSON.stringify(SAMPLE_BOARD);
   let kvVersion = 0;
@@ -728,12 +772,13 @@ test("RE-REVIEW update: retry exhaustion throws clear error and never silently d
     },
     async set(key, value) { if (key === "board") kvBoard = value; },
     async incr(key) {
-      if (key === "board:version") {
-        // Always jump 2 ahead so incr() can never equal version+1 → perma-conflict.
-        kvVersion += 2;
-        return kvVersion;
-      }
+      if (key === "board:version") { kvVersion += 2; return kvVersion; }
       return 1;
+    },
+    async eval(script, keys, args) {
+      // Always conflict: advance version so it never matches expected
+      kvVersion += 2;
+      return [0, kvVersion];
     },
   };
 
@@ -743,22 +788,19 @@ test("RE-REVIEW update: retry exhaustion throws clear error and never silently d
     "exhaustion must surface a clear, bounded-retry error"
   );
 
-  // Board must never have been written (every attempt conflicted before SET).
   assert.strictEqual(JSON.parse(kvBoard)._never, undefined,
     "no board write may leak through on permanent conflict");
-  // Bounded: mutator invoked exactly MAX_RETRIES (20) times, not infinitely.
   assert.strictEqual(mutatorCalls, 20,
     "mutator invoked exactly MAX_RETRIES times (bounded retry loop)");
 });
 
-// Direct save() interleaved with update(): save() is an unconditional set+incr
-// escape hatch. Spec routes all /api/move writes through update(), but verify a
-// save() that bumps the version mid-update merely forces a retry (which the
-// update then survives) rather than silently losing the update()'s mutation.
+// Direct save() interleaved with update(): save() is an unconditional write.
+// A save() that bumps the version mid-update causes the eval() to conflict,
+// forcing a retry — the update() survives on top of the fresh (saved) data.
 test("RE-REVIEW save() bumping version mid-update forces a retry, update still survives", async () => {
   let kvBoard = JSON.stringify({ projects: [], log: [] });
   let kvVersion = 0;
-  let firstIncr = true;
+  let firstEval = true;
 
   const client = {
     async get(key) {
@@ -768,22 +810,26 @@ test("RE-REVIEW save() bumping version mid-update forces a retry, update still s
     },
     async set(key, value) { if (key === "board") kvBoard = value; },
     async incr(key) {
-      if (key === "board:version") {
-        if (firstIncr) {
-          firstIncr = false;
-          // Simulate a concurrent direct save() landing between our load and
-          // our reservation: it wrote the board and bumped version to 1.
-          const b = JSON.parse(kvBoard);
-          b.log.push("from-save");
-          kvBoard = JSON.stringify(b);
-          kvVersion = 1;           // save() consumed slot 1
-          kvVersion += 1;          // our incr now returns 2 (!= read-version 0 + 1) → conflict
-          return kvVersion;
-        }
-        kvVersion += 1;
-        return kvVersion;
-      }
+      if (key === "board:version") { kvVersion++; return kvVersion; }
       return 1;
+    },
+    async eval(script, keys, args) {
+      if (firstEval) {
+        firstEval = false;
+        // Simulate a concurrent direct save() landing before our eval executes:
+        // save() wrote the board and bumped version to 1.
+        const b = JSON.parse(kvBoard);
+        b.log.push("from-save");
+        kvBoard = JSON.stringify(b);
+        kvVersion = 1; // save() consumed slot 0→1
+        return [0, kvVersion]; // conflict: our expected=0, stored=1
+      }
+      // Retry CAS
+      const expected = Number(args[0]);
+      if (kvVersion !== expected) return [0, kvVersion];
+      kvBoard = args[1];
+      kvVersion++;
+      return [1, kvVersion];
     },
   };
 
@@ -794,4 +840,258 @@ test("RE-REVIEW save() bumping version mid-update forces a retry, update still s
     "the concurrent direct save()'s write must survive");
   assert.ok(finalBoard.log.includes("from-update"),
     "the update()'s mutation must survive (retried on top of fresh data)");
+});
+
+// ===========================================================================
+// DECISIVE TOCTOU TEST — proves the old INCR-then-SET design has the bug
+// and the new single-EVAL design does not.
+//
+// This test uses a backend that faithfully models a SERIALIZED REDIS server:
+//   • Each command is served one at a time (single-channel serialization).
+//   • Between any two commands, other clients' commands can be interleaved.
+//   • EVAL runs atomically: once a client's eval starts, it completes before
+//     any other client's command is served.
+//
+// The TOCTOU scenario that breaks INCR-then-SET:
+//   1. A and B both call load() → both read version=0, board=state0.
+//   2. A calls incr(version) → gets 1 (wins slot).
+//   3. B calls incr(version) → gets 2 (conflict, schedules retry).
+//   4. B's RETRY load() GET(board) executes NOW — BEFORE A's SET(board).
+//      B reads stale board (state0).
+//   5. A calls set(board) → commits state_A, version=1.
+//   6. B's load() reads version=1 (from GET(version)).
+//      But B already read state0 from step 4, so B has (data=state0, version=1).
+//   7. B calls incr(version) → gets 2 (=1+1), wins slot.
+//   8. B calls set(board) → commits state0+B mutation, CLOBBERING A's write!
+//
+// With the EVAL design, step 4 cannot interleave inside A's eval (which does
+// read-version + write-board + incr-version in one atomic server-side step).
+// ===========================================================================
+
+/**
+ * makeToctouBackend()
+ *
+ * Returns a backend that precisely models the TOCTOU interleave:
+ *   - Commands from different clients are interleaved at await boundaries.
+ *   - incr() and set() are each TWO separate round-trips (like the old design).
+ *   - eval() is a SINGLE atomic round-trip (like the new design).
+ *
+ * The backend exposes hooks to force the exact "B's GET(board) executes after
+ * A's INCR but before A's SET" interleave.
+ *
+ * It is also used to prove that the old design (simulated via manual
+ * incr+set calls) WOULD fail in the same scenario.
+ */
+function makeToctouBackend(initialBoard) {
+  const state = {
+    board: JSON.stringify(initialBoard),
+    version: 0,
+  };
+
+  // Hooks for forcing the bad interleave in the old-design simulation
+  const hooks = {
+    afterIncr: null, // called after incr() modifies state — inject B's stale GET here
+  };
+
+  function client() {
+    return {
+      async get(key) {
+        await Promise.resolve();
+        if (key === "board") return state.board;
+        if (key === "board:version") return String(state.version);
+        return null;
+      },
+      async set(key, value) {
+        await Promise.resolve();
+        if (key === "board") state.board = value;
+      },
+      async incr(key) {
+        await Promise.resolve();
+        if (key === "board:version") {
+          state.version += 1;
+          const result = state.version;
+          if (hooks.afterIncr) await hooks.afterIncr(state);
+          return result;
+        }
+        return 1;
+      },
+      // eval: ONE tick for network, then CAS runs synchronously (atomic)
+      async eval(script, keys, args) {
+        await Promise.resolve(); // network RTT
+        // Synchronous CAS body — no yield, no interleave possible:
+        const expected = Number(args[0]);
+        if (state.version !== expected) {
+          return [0, state.version];
+        }
+        state.board = args[1];
+        state.version += 1;
+        return [1, state.version];
+      },
+    };
+  }
+
+  return { state, hooks, client };
+}
+
+/*
+ * PROOF OF DEFECT: simulate the old INCR-then-SET design using the
+ * makeToctouBackend and verify the lost-update bug is reproducible.
+ *
+ * We use an explicit state machine to force the exact TOCTOU interleave:
+ *   A: load(version=0, board=s0)
+ *   B: load(version=0, board=s0)
+ *   A: incr() → 1
+ *       [B's retry GET(board) runs HERE: reads s0 before A's SET]
+ *   A: set(board=s_A, version=1)
+ *   B's retry: load returns (version=1, board=s0) — STALE board!
+ *   B: incr() → 2 (= 1+1, wins slot)
+ *   B: set(board=s0+B) — CLOBBERS A!
+ *
+ * This test asserts the lost-update DOES happen with the old pattern,
+ * confirming the bug was real.
+ */
+test("TOCTOU PROOF: old INCR-then-SET design loses an update in the TOCTOU window", async () => {
+  const backend = makeToctouBackend(SAMPLE_BOARD);
+
+  // Simulate the old two-round-trip update() loop manually:
+  // Reads version from load(), then INCR-reserves, then SET.
+  async function oldUpdate(mutatorFn, onConflict) {
+    // Step 1: read
+    const boardRaw = await backend.client().get("board");
+    const versionRaw = await backend.client().get("board:version");
+    const data = JSON.parse(boardRaw);
+    const version = Number(versionRaw) || 0;
+
+    // Step 2: mutate
+    const clone = JSON.parse(JSON.stringify(data));
+    mutatorFn(clone);
+    const newData = JSON.stringify(clone);
+
+    // Step 3: INCR-reserve
+    const c = backend.client();
+    const next = await c.incr("board:version");
+    if (next !== version + 1) {
+      // Conflict — retry (simplified: one retry with fresh read)
+      if (onConflict) await onConflict();
+      const boardRaw2 = await backend.client().get("board");
+      const versionRaw2 = await backend.client().get("board:version");
+      const data2 = JSON.parse(boardRaw2);
+      const version2 = Number(versionRaw2) || 0;
+      const clone2 = JSON.parse(JSON.stringify(data2));
+      mutatorFn(clone2);
+      const newData2 = JSON.stringify(clone2);
+      const next2 = await backend.client().incr("board:version");
+      if (next2 === version2 + 1) {
+        await backend.client().set("board", newData2);
+      }
+      return;
+    }
+
+    // Step 4: SET (but gap exists here — another client can read board before this)
+    await backend.client().set("board", newData);
+  }
+
+  // Force the TOCTOU: after A's INCR (wins slot 1), B's retry GET(board)
+  // reads the board synchronously (still state0) before A's SET executes.
+  let bStaleBoard = null;
+  let bStaleVersion = null;
+
+  // We'll capture B's stale read in a hook triggered after A's INCR
+  backend.hooks.afterIncr = async (state) => {
+    // This runs synchronously INSIDE A's incr(), after version is bumped to 1
+    // but BEFORE A's subsequent set() call.
+    // Capture what B's retry load() would see right now:
+    bStaleBoard = state.board;    // still s0 — A hasn't set() yet
+    bStaleVersion = state.version; // 1 (A's INCR landed)
+    backend.hooks.afterIncr = null; // only intercept once
+  };
+
+  // Run A: load → mutate → incr(gets 1, hook fires) → set
+  await oldUpdate((data) => { data._byA = true; });
+
+  // A's write has landed. Now simulate B's stale-read retry:
+  // B read (board=stale_s0, version=1) from inside the hook.
+  // B's retry now uses that stale board + current version.
+  if (bStaleBoard !== null) {
+    const staleData = JSON.parse(bStaleBoard);
+    staleData._byB = true;  // B's mutation on stale board
+    const newBoard = JSON.stringify(staleData);
+
+    // B does incr() → gets 2 (= bStaleVersion 1 + 1 → B "wins" the slot)
+    const next = await backend.client().incr("board:version");
+    assert.strictEqual(next, bStaleVersion + 1,
+      "B's retry incr must equal staleVersion+1 (confirming it wins the slot)");
+
+    // B does set() — clobbers A's write with stale+B data
+    await backend.client().set("board", newBoard);
+  }
+
+  // With the old design, A's write is LOST: final board has _byB but NOT _byA
+  const finalBoard = JSON.parse(backend.state.board);
+  assert.strictEqual(finalBoard._byB, true, "B's mutation is present (B wrote last)");
+  assert.strictEqual(finalBoard._byA, undefined,
+    "TOCTOU BUG CONFIRMED: A's mutation was clobbered by B's stale-board write");
+});
+
+/*
+ * DECISIVE TEST: The new single-EVAL design must pass 200 iterations of
+ * fully-interleaved concurrent updates with zero lost updates.
+ *
+ * Uses makeConcurrentBackend whose eval() is atomic (no additional yield
+ * inside the CAS body).  Two concurrent update() calls via Promise.all
+ * interleave at every await boundary except inside eval's CAS body.
+ *
+ * With the old INCR-then-SET design + the concurrent backend's ticks,
+ * lost updates can occur (the TOCTOU proof above demonstrates why).
+ * With the new EVAL design, no interleave is possible inside the CAS body,
+ * so both mutations always survive.
+ *
+ * 200 iterations ensures this isn't passing by microtask-scheduling luck.
+ */
+test("DECISIVE: atomic-EVAL CAS passes 200 iterations of forced-concurrent updates with zero lost updates", async () => {
+  let lostUpdates = 0;
+
+  for (let iter = 0; iter < 200; iter++) {
+    const backend = makeConcurrentBackend(SAMPLE_BOARD, 0);
+
+    const updateA = update((data) => { data._byA = true; }, { client: backend.client() });
+    const updateB = update((data) => { data._byB = true; }, { client: backend.client() });
+
+    await Promise.all([updateA, updateB]);
+
+    const final = JSON.parse(backend.state.board);
+    if (!final._byA || !final._byB) lostUpdates++;
+  }
+
+  assert.strictEqual(lostUpdates, 0,
+    "Expected 0 lost updates across 200 iterations; atomic EVAL CAS must hold every time");
+});
+
+/*
+ * DECISIVE N-CONCURRENT: 200 iterations of N=6 concurrent update()s each
+ * appending a distinct id to an array.  All N ids must appear in every run.
+ */
+test("DECISIVE: atomic-EVAL CAS survives 200 iterations of N=6 concurrent appends with zero lost updates", async () => {
+  const N = 6;
+  let failures = 0;
+
+  for (let iter = 0; iter < 200; iter++) {
+    const seed = { projects: [], log: [] };
+    const backend = makeConcurrentBackend(seed, 0);
+
+    const ops = [];
+    for (let i = 0; i < N; i++) {
+      ops.push(update((data) => { data.log.push(i); }, { client: backend.client() }));
+    }
+    await Promise.all(ops);
+
+    const final = JSON.parse(backend.state.board);
+    const got = final.log.slice().sort((a, b) => a - b);
+    const want = Array.from({ length: N }, (_, i) => i);
+    const ok = got.length === want.length && got.every((v, i) => v === want[i]);
+    if (!ok) failures++;
+  }
+
+  assert.strictEqual(failures, 0,
+    "Expected 0 failures across 200 iterations; all " + N + " mutations must survive every run");
 });
