@@ -806,6 +806,77 @@ describe("reviewer: remoteMove additional failure / edge paths", () => {
   });
 });
 
+describe("reviewer: Set-Cookie parsing robustness (cookie name must not drift)", () => {
+  // Capture the exact Cookie header remoteMove sends to /api/move for a given
+  // Set-Cookie value from login. Returns the Cookie string (or undefined).
+  async function cookieSentForSetCookie(setCookie) {
+    let sentCookie;
+    const fakeFetch = makeFakeFetch([
+      {
+        match: (url) => url.endsWith("/api/login"),
+        handler: () => fakeResponse({ status: 200, body: { ok: true }, setCookie }),
+      },
+      {
+        match: (url) => url.endsWith("/api/move"),
+        handler: (_url, init) => {
+          sentCookie = init.headers.Cookie;
+          return fakeResponse({ status: 200, body: { ok: true } });
+        },
+      },
+    ]);
+    await remoteMove({
+      url: "https://example.vercel.app",
+      password: "pw",
+      id: "T1",
+      to: "progress",
+      by: "engineer",
+      fetch: fakeFetch,
+    });
+    return sentCookie;
+  }
+
+  test("reordered attributes (HttpOnly first, value last attr) still extracts value", async () => {
+    const sent = await cookieSentForSetCookie(
+      "board_token=val-XYZ; Max-Age=28800; Path=/; HttpOnly; Secure; SameSite=Lax"
+    );
+    assert.strictEqual(sent, "board_token=val-XYZ");
+  });
+
+  test("attribute substrings do not fool the parser (no 'token=' false match)", async () => {
+    // A Secure/SameSite-laden cookie; the real value contains no 'token=' confusion.
+    const sent = await cookieSentForSetCookie(
+      "board_token=abc.def; Path=/; HttpOnly; SameSite=Strict"
+    );
+    // Must re-emit using the correct name and full value (value has a dot).
+    assert.strictEqual(sent, "board_token=abc.def");
+  });
+
+  test("value containing '=' (base64url padding edge) is preserved intact", async () => {
+    // parseCookies splits on first '=' only, so an '=' inside the value survives.
+    const sent = await cookieSentForSetCookie(
+      "board_token=a=b=c; Path=/; HttpOnly"
+    );
+    assert.strictEqual(sent, "board_token=a=b=c");
+  });
+
+  test("wrong cookie name in Set-Cookie → no Cookie header (fails safe, no crash)", async () => {
+    // If login somehow set a differently-named cookie, remoteMove must not
+    // fabricate a token; it sends no Cookie header and the move would 401.
+    const sent = await cookieSentForSetCookie("token=legacy-wrong; Path=/; HttpOnly");
+    assert.strictEqual(sent, undefined, "must NOT send a Cookie when board_token is absent");
+  });
+
+  test("empty Set-Cookie header → no Cookie header, no crash", async () => {
+    const sent = await cookieSentForSetCookie("");
+    assert.strictEqual(sent, undefined);
+  });
+
+  test("leading whitespace before cookie name is tolerated", async () => {
+    const sent = await cookieSentForSetCookie("  board_token=spaced; Path=/");
+    assert.strictEqual(sent, "board_token=spaced");
+  });
+});
+
 describe("reviewer: CLI remote config must NOT leak to non-move commands", () => {
   test("list runs locally and prints projects even when remote env is set", () => {
     const tmp = freshData();
