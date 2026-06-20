@@ -900,3 +900,295 @@ test("move: uat->backlog (reject) by po => 200 with reject flag", async () => {
   assert.strictEqual(t.status, "backlog", "persisted status must be 'backlog'");
   assert.strictEqual(t.reject, true, "persisted reject flag must be true");
 });
+
+// ============================================================================
+// SECTION 7: Reviewer edge-case tests (added by QA/reviewer)
+// ============================================================================
+
+// ---- 7a. Auth gate: malformed / garbage cookies on BOTH endpoints ----------
+
+const GARBAGE_COOKIES = [
+  ["empty token value", auth.COOKIE_NAME + "="],
+  ["garbage non-base64 token", auth.COOKIE_NAME + "=$$$not-a-token$$$"],
+  ["only one part (no dot)", auth.COOKIE_NAME + "=justonepart"],
+  ["three parts", auth.COOKIE_NAME + "=a.b.c"],
+  ["right name wrong value", auth.COOKIE_NAME + "=deadbeef.deadbeef"],
+  ["wrong cookie name entirely", "some_other_cookie=" + "x.y"],
+  ["malformed pair, no equals", "garbagewithoutequals"],
+];
+
+for (const [label, cookie] of GARBAGE_COOKIES) {
+  test("board: garbage cookie (" + label + ") => 401, no data leak", async () => {
+    const { kvOpts } = freshKvOpts();
+    const handler = createBoard({ secret: TEST_SECRET, kvOpts, now: nowFn });
+    const req = makeReq({ method: "GET", headers: { cookie } });
+    const res = makeRes();
+    await handler(req, res);
+    assert.strictEqual(res._status, 401, "garbage cookie must be 401");
+    assert.ok(!res._body.projects, "no projects leaked on 401");
+    assert.ok(!res._body.workflow, "no workflow leaked on 401");
+  });
+
+  test("move: garbage cookie (" + label + ") => 401, KV untouched", async () => {
+    const { kvOpts, client } = freshKvOpts();
+    const handler = createMove({ secret: TEST_SECRET, kvOpts, now: nowFn });
+    const boardBefore = client._store["board"];
+    const versionBefore = client._store["board:version"];
+    const req = makeReq({
+      method: "POST",
+      headers: { cookie },
+      body: { id: "EP-1-T1", to: "done", by: "po" },
+    });
+    const res = makeRes();
+    await handler(req, res);
+    assert.strictEqual(res._status, 401, "garbage cookie must be 401 on move");
+    assert.ok(!res._body.projects, "no projects leaked in move 401 body");
+    assert.ok(!res._body.workflow, "no workflow leaked in move 401 body");
+    assert.strictEqual(client._store["board"], boardBefore, "board untouched on rejected auth");
+    assert.strictEqual(
+      client._store["board:version"],
+      versionBefore,
+      "version counter untouched on rejected auth (no INCR before gate)"
+    );
+  });
+}
+
+// ---- 7b. move 401 body must carry zero board data --------------------------
+
+test("move: no cookie => 401 body has zero board data (no projects/workflow leak)", async () => {
+  const { kvOpts } = freshKvOpts();
+  const handler = createMove({ secret: TEST_SECRET, kvOpts, now: nowFn });
+  const req = makeReq({
+    method: "POST",
+    headers: {},
+    body: { id: "EP-1-T1", to: "done", by: "po" },
+  });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 401);
+  assert.ok(!res._body.projects, "no projects in move 401 body");
+  assert.ok(!res._body.workflow, "no workflow in move 401 body");
+  assert.ok(!res._body.task, "no task in move 401 body");
+});
+
+// ---- 7c. Empty / missing BOARD_SECRET must NOT bypass the gate -------------
+
+test("board: empty secret rejects a token signed with the real secret (no bypass)", async () => {
+  const { kvOpts } = freshKvOpts();
+  // Handler configured with empty secret (simulates BOARD_SECRET unset on Vercel)
+  const handler = createBoard({ secret: "", kvOpts, now: nowFn });
+  // Attacker presents a token signed with the REAL secret
+  const token = makeValidToken();
+  const req = makeReq({
+    method: "GET",
+    headers: { cookie: cookieHeader(token) },
+  });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 401, "mismatched (empty) secret must reject => 401");
+  assert.ok(!res._body.projects, "no data leak when secret mismatches");
+});
+
+test("move: empty secret rejects real-secret token and leaves KV untouched", async () => {
+  const { kvOpts, client } = freshKvOpts();
+  const handler = createMove({ secret: "", kvOpts, now: nowFn });
+  const boardBefore = client._store["board"];
+  const token = makeValidToken();
+  const req = makeReq({
+    method: "POST",
+    headers: { cookie: cookieHeader(token) },
+    body: { id: "EP-1-T1", to: "done", by: "po" },
+  });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 401, "empty-secret handler must reject => 401");
+  assert.strictEqual(client._store["board"], boardBefore, "KV untouched");
+});
+
+// ---- 7d. Crash-safety: KV failure surfaces as 500, never a data leak/hang --
+
+test("board: KV load failure => 500, no board data leaked, no hang", async () => {
+  const exploding = {
+    async get() { throw new Error("boom: KV down"); },
+    async set() { throw new Error("boom"); },
+    async incr() { throw new Error("boom"); },
+  };
+  const handler = createBoard({ secret: TEST_SECRET, kvOpts: { client: exploding }, now: nowFn });
+  const req = authedGetReq();
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 500, "KV failure must surface as 500");
+  assert.ok(!res._body.projects, "no projects leaked in 500 body");
+  assert.ok(!res._body.workflow, "no workflow leaked in 500 body");
+  assert.strictEqual(res._body.ok, false, "500 body must report failure");
+});
+
+test("move: KV update failure => 500, no data leaked, no hang", async () => {
+  const exploding = {
+    async get() { throw new Error("boom: KV down"); },
+    async set() { throw new Error("boom"); },
+    async incr() { throw new Error("boom"); },
+  };
+  const handler = createMove({ secret: TEST_SECRET, kvOpts: { client: exploding }, now: nowFn });
+  const req = authedPostReq({ id: "EP-1-T1", to: "done", by: "po" });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 500, "KV failure must surface as 500");
+  assert.ok(!res._body.projects, "no projects leaked in move 500 body");
+  assert.strictEqual(res._body.ok, false);
+});
+
+// ---- 7e. testsPass must be strict === true at the handler boundary ----------
+
+test("move: test->uat with truthy-but-not-true testsPass ('yes') => 409 (strict ===)", async () => {
+  const { kvOpts, client } = freshKvOpts();
+  const handler = createMove({ secret: TEST_SECRET, kvOpts, now: nowFn });
+  const boardBefore = client._store["board"];
+  const req = authedPostReq({ id: "EP-1-T2", to: "uat", by: "qa", testsPass: "yes" });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 409, "non-strict-true testsPass must be blocked");
+  assert.strictEqual(client._store["board"], boardBefore, "no change when testsPass is not === true");
+});
+
+// ---- 7f. Concurrency THROUGH the handler with forced CAS contention --------
+
+test("concurrency: forced CAS contention through move handler => both persist, no lost update", async () => {
+  /*
+   * REVIEWER FINDING (currently RED): this exposes a lost-update defect in the
+   * shared lib/kv-store.js CAS that /api/move relies on for the spec's
+   * concurrency acceptance criterion ("hai move gần như đồng thời không nuốt
+   * mất nhau").
+   *
+   * Drives genuine contention: both load() calls observe version 0 before
+   * either INCR runs. The backend serializes INCR (Redis semantics) so exactly
+   * one writer reserves version 1 and writes; the other gets version 2, detects
+   * the conflict, reloads, and retries.
+   *
+   * The bug: kv-store.update() reserves a version slot via INCR, but the board
+   * SET is a SEPARATE, LATER command. The losing writer's retry GET(board) can
+   * land in the window AFTER the winner's INCR but BEFORE the winner's SET,
+   * reading STALE board state, then SET its own mutation over the winner's =>
+   * the winner's move is silently lost. INCR-as-reservation does not fence the
+   * board read against an in-flight, uncommitted board write.
+   *
+   * Owned by T5? No — the fix belongs in lib/kv-store.js (T1). This test stays
+   * red until that CAS is made safe (e.g. single atomic Lua check-and-set, or a
+   * version embedded in the board value compared inside one atomic op).
+   *
+   * Both moves must end up persisted (no lost update).
+   */
+  const state = { board: JSON.stringify(SAMPLE_BOARD), version: 0 };
+
+  // Gate that releases both load()s only after BOTH have read version 0.
+  let loadCount = 0;
+  let releaseBoth;
+  const bothLoaded = new Promise((r) => { releaseBoth = r; });
+
+  function makeContendingClient() {
+    return {
+      async get(key) {
+        if (key === "board") {
+          const snapshot = state.board;
+          loadCount += 1;
+          if (loadCount === 2) releaseBoth();
+          // Hold until both readers have captured the current snapshot.
+          await bothLoaded;
+          return snapshot;
+        }
+        if (key === "board:version") return String(state.version);
+        return null;
+      },
+      async set(key, value) {
+        await Promise.resolve();
+        if (key === "board") state.board = value;
+      },
+      async incr(key) {
+        // Serialized atomic increment (Redis INCR semantics).
+        await Promise.resolve();
+        if (key === "board:version") {
+          state.version += 1;
+          return state.version;
+        }
+        return 1;
+      },
+    };
+  }
+
+  const deps = (client) => ({ secret: TEST_SECRET, kvOpts: { client }, now: nowFn });
+  const handlerA = createMove(deps(makeContendingClient()));
+  const handlerB = createMove(deps(makeContendingClient()));
+
+  const reqA = authedPostReq({ id: "EP-1-T3", to: "progress", by: "engineer" });
+  const resA = makeRes();
+  const reqB = authedPostReq({ id: "EP-1-T1", to: "done", by: "po" });
+  const resB = makeRes();
+
+  await Promise.all([handlerA(reqA, resA), handlerB(reqB, resB)]);
+
+  assert.strictEqual(resA._status, 200, "Move A must succeed after CAS resolution");
+  assert.strictEqual(resB._status, 200, "Move B must succeed after CAS resolution");
+
+  const kv = require("../lib/kv-store");
+  const final = JSON.parse(state.board);
+  const t3 = final.projects[0].epics[0].tasks.find((t) => t.id === "EP-1-T3");
+  const t1 = final.projects[0].epics[0].tasks.find((t) => t.id === "EP-1-T1");
+  assert.strictEqual(t3.status, "progress", "Move A persisted (not lost)");
+  assert.strictEqual(t1.status, "done", "Move B persisted (not lost)");
+  // version advanced by exactly 2 successful writes (each owns one slot)
+  assert.ok(state.version >= 2, "both writers reserved a version slot");
+  // touch kv to keep import meaningful
+  assert.ok(typeof kv.update === "function");
+});
+
+// ---- 7g. login: error text must not leak password-closeness ----------------
+
+test("login: wrong-password error text is generic (no length/closeness oracle)", async () => {
+  const handler = createLogin({ password: TEST_PASSWORD, secret: TEST_SECRET, now: nowFn });
+
+  async function loginWith(pw) {
+    const req = makeReq({ method: "POST", body: { password: pw } });
+    const res = makeRes();
+    await handler(req, res);
+    return res;
+  }
+
+  // A near-match (same length, one char off) and a wildly-different one
+  const near = await loginWith(TEST_PASSWORD.slice(0, -1) + "X");
+  const far = await loginWith("x");
+
+  assert.strictEqual(near._status, 401);
+  assert.strictEqual(far._status, 401);
+  // Identical generic error regardless of how close the guess was.
+  assert.deepStrictEqual(
+    near._body.error,
+    far._body.error,
+    "error message must be identical for near and far wrong guesses"
+  );
+  assert.ok(!near._headers["set-cookie"], "no cookie on near miss");
+  assert.ok(!far._headers["set-cookie"], "no cookie on far miss");
+});
+
+// ---- 7h. login: malformed JSON string body => 400, no cookie ---------------
+
+test("login: malformed JSON string body => 400, no cookie", async () => {
+  const handler = createLogin({ password: TEST_PASSWORD, secret: TEST_SECRET, now: nowFn });
+  const req = makeReq({ method: "POST", body: "{not valid json" });
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 400, "malformed JSON must be 400");
+  assert.ok(!res._headers["set-cookie"], "no cookie on malformed body");
+});
+
+// ---- 7i. move: malformed JSON string body (post-auth) => 400, KV untouched -
+
+test("move: authed but malformed JSON body => 400, KV untouched", async () => {
+  const { kvOpts, client } = freshKvOpts();
+  const handler = createMove({ secret: TEST_SECRET, kvOpts, now: nowFn });
+  const boardBefore = client._store["board"];
+  const req = authedPostReq("{bad json");
+  const res = makeRes();
+  await handler(req, res);
+  assert.strictEqual(res._status, 400, "malformed body must be 400");
+  assert.strictEqual(client._store["board"], boardBefore, "no KV change on 400");
+});
