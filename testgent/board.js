@@ -5,11 +5,17 @@
  * và tự ghi history. KHÔNG sửa board-data.json bằng tay.
  *
  * Dùng: node board.js <lệnh> ...   (xem "node board.js help")
+ *
+ * Remote mode (move command only):
+ *   Khi có cấu hình remote (--remote <url> --password <pw> hoặc biến môi trường
+ *   BOARD_REMOTE / BOARD_PASSWORD), lệnh move sẽ POST lên /api/move của Vercel
+ *   thay vì ghi file local. Các lệnh khác vẫn dùng file local.
  */
 const fs = require("fs");
 const path = require("path");
 const { load: storeLoad, save: storeSave, findTask } = require("./lib/store.js");
 const { DEFAULT_WORKFLOW, applyMove } = require("./lib/workflow.js");
+const { isRemoteConfigured, resolveConfig, remoteMove } = require("./lib/remote.js");
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -39,6 +45,38 @@ if (cmd === "move") {
   const id = argv[1], to = argv[2], by = getFlag("by");
   if (!id || !to || by === undefined) fail("Cú pháp: node board.js move <task-id> <status> --by <engineer|qa|po> [--tests-pass]");
   if (by === true) fail("Thiếu giá trị cho --by (engineer | qa | po).");
+
+  // Collect remote config from flags (override env).
+  const remoteOpts = {
+    remote: typeof getFlag("remote") === "string" ? getFlag("remote") : undefined,
+    password: typeof getFlag("password") === "string" ? getFlag("password") : undefined,
+  };
+
+  if (isRemoteConfigured(remoteOpts)) {
+    // --- Remote mode: POST to Vercel API ---
+    const { url, password } = resolveConfig(remoteOpts);
+    (async () => {
+      const result = await remoteMove({
+        url,
+        password,
+        id,
+        to,
+        by,
+        testsPass: hasFlag("tests-pass"),
+      });
+      if (result.ok) {
+        ok(id + ": → " + to + " (by " + by + ") [remote]");
+        process.exit(0);
+      } else {
+        fail(result.error || "Remote move failed: HTTP " + result.status);
+      }
+    })();
+    // Return here so we do not fall through to the rest of the script.
+    // The async IIFE will call process.exit when done.
+    return;
+  }
+
+  // --- Local file mode (original behavior) ---
   const d = load();
   const f = findTask(d, id);
   if (!f) fail("Task không tồn tại: " + id);
@@ -140,12 +178,18 @@ console.log(`board — quản lý trạng thái task, enforce state machine.
 
 Lệnh:
   node board.js move <task-id> <status> --by <engineer|qa|po> [--tests-pass]
+                     [--remote <url> --password <pw>]  (remote mode: POST tới Vercel)
   node board.js list  [--project <id>] [--epic <id>] [--status <s>]
   node board.js show  <task-id>
   node board.js add-task    --project <id> --epic <id> --title "..." [--agent ..] [--deps "a,b"]
   node board.js create-epic --project <id> --id <EP-x> --title "..." [--spec path]
   node board.js init
   (thêm --file <path> để trỏ tới board-data.json khác; mặc định ./board-data.json)
+
+Remote mode (chỉ lệnh move):
+  Khi có --remote <url> --password <pw> (hoặc env BOARD_REMOTE / BOARD_PASSWORD),
+  lệnh move sẽ POST lên Vercel API thay vì ghi file local.
+  Ưu tiên: flag > env.
 
 Luồng:  backlog → progress → test → uat → done   (reject → backlog)
 Quyền:  engineer (backlog→progress→test) · qa (test→uat/reject) · po (uat→done/reject)`);
