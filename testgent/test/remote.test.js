@@ -172,7 +172,7 @@ describe("remoteMove — success path", () => {
           return fakeResponse({
             status: 200,
             body: { ok: true },
-            setCookie: "token=abc123; Path=/; HttpOnly",
+            setCookie: "board_token=abc123; Path=/; HttpOnly",
           });
         },
       },
@@ -210,10 +210,10 @@ describe("remoteMove — success path", () => {
     assert.strictEqual(moveCalls[0].body.by, "engineer");
     assert.strictEqual(moveCalls[0].body.testsPass, false);
 
-    // Move was called with the session cookie.
+    // Move was called with the session cookie using the correct cookie name.
     assert.ok(
-      moveCalls[0].headers.Cookie && moveCalls[0].headers.Cookie.includes("token=abc123"),
-      "Cookie header must carry token from login"
+      moveCalls[0].headers.Cookie && moveCalls[0].headers.Cookie.includes("board_token=abc123"),
+      "Cookie header must carry board_token from login (correct cookie name)"
     );
   });
 
@@ -223,7 +223,7 @@ describe("remoteMove — success path", () => {
       {
         match: (url) => url.endsWith("/api/login"),
         handler: () =>
-          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "board_token=t; Path=/" }),
       },
       {
         match: (url) => url.endsWith("/api/move"),
@@ -255,7 +255,7 @@ describe("remoteMove — success path", () => {
         handler: (url) => {
           calls.push(url);
           if (url.includes("/api/login"))
-            return fakeResponse({ status: 200, body: {}, setCookie: "token=t; Path=/" });
+            return fakeResponse({ status: 200, body: {}, setCookie: "board_token=t; Path=/" });
           return fakeResponse({ status: 200, body: { ok: true } });
         },
       },
@@ -310,7 +310,7 @@ describe("remoteMove — failure paths", () => {
       {
         match: (url) => url.endsWith("/api/login"),
         handler: () =>
-          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "board_token=t; Path=/" }),
       },
       {
         match: (url) => url.endsWith("/api/move"),
@@ -359,7 +359,7 @@ describe("remoteMove — failure paths", () => {
   test("network error during move is surfaced", async () => {
     const fakeFetch = async (url) => {
       if (url.endsWith("/api/login"))
-        return fakeResponse({ status: 200, body: {}, setCookie: "token=t; Path=/" });
+        return fakeResponse({ status: 200, body: {}, setCookie: "board_token=t; Path=/" });
       throw new Error("ETIMEDOUT");
     };
 
@@ -484,7 +484,7 @@ describe("board.js move — remote mode (stub server)", () => {
     const stub = await startStubServer({
       loginStatus: 200,
       loginBody: { ok: true },
-      loginCookie: "token=stubtoken; Path=/; HttpOnly",
+      loginCookie: "board_token=stubtoken; Path=/; HttpOnly",
       moveStatus: 200,
       moveBody: { ok: true },
     });
@@ -521,7 +521,7 @@ describe("board.js move — remote mode (stub server)", () => {
     const stub = await startStubServer({
       loginStatus: 200,
       loginBody: { ok: true },
-      loginCookie: "token=flagtoken; Path=/",
+      loginCookie: "board_token=flagtoken; Path=/",
       moveStatus: 200,
       moveBody: { ok: true },
     });
@@ -566,7 +566,7 @@ describe("board.js move — remote mode (stub server)", () => {
     const stub = await startStubServer({
       loginStatus: 200,
       loginBody: { ok: true },
-      loginCookie: "token=t; Path=/",
+      loginCookie: "board_token=t; Path=/",
       moveStatus: 409,
       moveBody: { error: "Invalid move" },
     });
@@ -588,7 +588,7 @@ describe("board.js move — remote mode (stub server)", () => {
     const stub = await startStubServer({
       loginStatus: 200,
       loginBody: { ok: true },
-      loginCookie: "token=t; Path=/",
+      loginCookie: "board_token=t; Path=/",
       moveStatus: 200,
       moveBody: { ok: true },
     });
@@ -729,7 +729,7 @@ describe("reviewer: remoteMove additional failure / edge paths", () => {
       {
         match: (url) => url.endsWith("/api/login"),
         handler: () =>
-          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "board_token=t; Path=/" }),
       },
       {
         match: (url) => url.endsWith("/api/move"),
@@ -756,7 +756,7 @@ describe("reviewer: remoteMove additional failure / edge paths", () => {
       {
         match: (url) => url.endsWith("/api/login"),
         handler: () =>
-          fakeResponse({ status: 200, body: { ok: true }, setCookie: "token=t; Path=/" }),
+          fakeResponse({ status: 200, body: { ok: true }, setCookie: "board_token=t; Path=/" }),
       },
       {
         match: (url) => url.endsWith("/api/move"),
@@ -842,7 +842,7 @@ describe("reviewer: remote move must NOT touch the local file", () => {
     const stub = await startStubServer({
       loginStatus: 200,
       loginBody: { ok: true },
-      loginCookie: "token=t; Path=/",
+      loginCookie: "board_token=t; Path=/",
       moveStatus: 200,
       moveBody: { ok: true },
     });
@@ -863,5 +863,249 @@ describe("reviewer: remote move must NOT touch the local file", () => {
       before,
       "remote move must NOT write the local file"
     );
+  });
+});
+
+// ─── ANTI-REGRESSION INTEGRATION TEST ───────────────────────────────────────
+//
+// This test does NOT mock the cookie round-trip. It stands up a REAL in-process
+// HTTP server routing to the actual api/login.js and api/move.js handlers
+// (factory form with injected in-memory KV), so Set-Cookie from login and Cookie
+// on move flow through REAL HTTP headers. This means the cookie name MATTERS:
+// if remote.js sends "token=<value>" instead of "board_token=<value>", the auth
+// gate (which reads parseCookies(req.headers.cookie)[auth.COOKIE_NAME]) will NOT
+// find the token and will return 401, failing the test.
+//
+// This test WOULD FAIL against the old buggy code (which sent "token=<value>")
+// and PASSES after the fix (which sends "board_token=<value>").
+
+// Test constants — literals only, not real credentials.
+const INTEG_TEST_PASSWORD = "integration-test-pw-do-not-use";
+const INTEG_TEST_SECRET = "integration-test-secret-do-not-use";
+
+/**
+ * In-memory mock KV client (same shape as api.test.js).
+ */
+function makeMockKvClient(initialStore) {
+  const store = Object.assign(Object.create(null), initialStore || {});
+  return {
+    async get(key) {
+      return key in store ? store[key] : null;
+    },
+    async set(key, value) {
+      store[key] = value;
+    },
+    async incr(key) {
+      const current = key in store ? Number(store[key]) : 0;
+      const next = current + 1;
+      store[key] = String(next);
+      return next;
+    },
+    async eval(script, keys, args) {
+      const boardKey = keys[0];
+      const versionKey = keys[1];
+      const stored = versionKey in store ? (Number(store[versionKey]) || 0) : 0;
+      const expected = Number(args[0]);
+      if (stored !== expected) return [0, stored];
+      store[boardKey] = args[1];
+      const newv = stored + 1;
+      store[versionKey] = String(newv);
+      return [1, newv];
+    },
+    _store: store,
+  };
+}
+
+/** Minimal sample board with a task that an engineer can move backlog→progress. */
+const INTEG_SAMPLE_BOARD = {
+  workflow: {
+    states: ["backlog", "progress", "test", "uat", "done"],
+    labels: { backlog: "Chờ làm", progress: "Đang làm", test: "Test", uat: "UAT", done: "Xong" },
+    transitions: [
+      { from: "backlog", to: "progress", by: "engineer" },
+      { from: "progress", to: "test", by: "engineer" },
+      { from: "test", to: "uat", by: "qa", requires: "tests_pass" },
+      { from: "uat", to: "done", by: "po" },
+      { from: "uat", to: "backlog", by: "po", flag: "reject" },
+    ],
+    rules: [],
+  },
+  projects: [
+    {
+      id: "p1",
+      name: "Test Project",
+      epics: [
+        {
+          id: "EP-INTEG-1",
+          title: "Integration Epic",
+          tasks: [
+            { id: "INTEG-T1", title: "Task in backlog", status: "backlog", history: [] },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * Build a real in-process HTTP server routing to the actual api/login.js and
+ * api/move.js handlers. Returns a promise resolving to { url, client, close }.
+ */
+function startRealApiServer() {
+  const { createHandler: createLogin } = require("../api/login");
+  const { createHandler: createMove } = require("../api/move");
+  const kv = require("../lib/kv-store");
+
+  const client = makeMockKvClient({
+    board: JSON.stringify(INTEG_SAMPLE_BOARD),
+    "board:version": "0",
+  });
+
+  const loginHandler = createLogin({
+    password: INTEG_TEST_PASSWORD,
+    secret: INTEG_TEST_SECRET,
+  });
+
+  const moveHandler = createMove({
+    secret: INTEG_TEST_SECRET,
+    kvOpts: { client },
+  });
+
+  const server = http.createServer(async (req, res) => {
+    // Bridge Node's IncomingMessage → handler req/res adapter.
+    // Collect the raw body, then dispatch.
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", async () => {
+      const rawBody = Buffer.concat(chunks).toString("utf8");
+
+      // Adapt: handlers use req.body (pre-parsed object) or raw stream.
+      // Inject body as a pre-parsed object so handlers skip the stream path.
+      let parsedBody = undefined;
+      if (rawBody && rawBody.trim()) {
+        try { parsedBody = JSON.parse(rawBody); } catch (_) { parsedBody = rawBody; }
+      }
+
+      // Build a facade that looks like what the handler expects.
+      const handlerReq = {
+        method: req.method,
+        headers: req.headers,
+        body: parsedBody,
+        // Handlers may listen on "data"/"end" if body is undefined/null;
+        // since we set body above they won't need these.
+        on: () => {},
+      };
+
+      // Build a facade for res that routes back to the real Node response.
+      let statusCode = 200;
+      const handlerRes = {
+        status(code) { statusCode = code; return handlerRes; },
+        json(obj) {
+          res.writeHead(statusCode, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(obj));
+          return handlerRes;
+        },
+        setHeader(name, value) {
+          res.setHeader(name, value);
+        },
+      };
+
+      if (req.url === "/api/login" && req.method === "POST") {
+        await loginHandler(handlerReq, handlerRes);
+      } else if (req.url === "/api/move" && req.method === "POST") {
+        await moveHandler(handlerReq, handlerRes);
+      } else {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      resolve({
+        url: "http://127.0.0.1:" + port,
+        client,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+describe("ANTI-REGRESSION: remoteMove cookie name — real HTTP server with real auth gate", () => {
+  test("correct password: remoteMove succeeds and move is persisted in KV", async () => {
+    /*
+     * This test feeds remoteMove's output through REAL HTTP headers and the
+     * REAL auth gate (api/login.js issues board_token, api/move.js verifies it
+     * via auth.parseCookies()[auth.COOKIE_NAME]).
+     *
+     * OLD CODE: remote.js sent "token=<value>" → auth gate looked for
+     *   cookies["board_token"] → undefined → 401. Test would FAIL.
+     * FIXED CODE: remote.js sends "board_token=<value>" → gate finds it → 200.
+     */
+    const srv = await startRealApiServer();
+    try {
+      const result = await remoteMove({
+        url: srv.url,
+        password: INTEG_TEST_PASSWORD,
+        id: "INTEG-T1",
+        to: "progress",
+        by: "engineer",
+      });
+
+      assert.strictEqual(
+        result.ok,
+        true,
+        "remoteMove must succeed when cookie name matches auth gate expectation; " +
+        "if this is 401, remote.js is sending the wrong cookie name. error=" + result.error
+      );
+      assert.strictEqual(result.status, 200, "expected HTTP 200 from /api/move");
+
+      // Verify the move was actually persisted in the mock KV.
+      const kv = require("../lib/kv-store");
+      const { data } = await kv.load({ client: srv.client });
+      const task = data.projects[0].epics[0].tasks[0];
+      assert.strictEqual(
+        task.status,
+        "progress",
+        "INTEG-T1 must be persisted as 'progress' in the mock KV"
+      );
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("wrong password: remoteMove returns 401 and move is NOT persisted", async () => {
+    /*
+     * Negative check: wrong password → login 401 → remoteMove surfaces error,
+     * move endpoint is never called, KV unchanged.
+     */
+    const srv = await startRealApiServer();
+    try {
+      const result = await remoteMove({
+        url: srv.url,
+        password: "DEFINITELY_WRONG_PASSWORD",
+        id: "INTEG-T1",
+        to: "progress",
+        by: "engineer",
+      });
+
+      assert.strictEqual(result.ok, false, "wrong password must yield ok:false");
+      assert.strictEqual(result.status, 401, "wrong password must yield 401");
+      assert.ok(result.error, "error field must be present");
+
+      // KV must be unchanged.
+      const kv = require("../lib/kv-store");
+      const { data } = await kv.load({ client: srv.client });
+      const task = data.projects[0].epics[0].tasks[0];
+      assert.strictEqual(
+        task.status,
+        "backlog",
+        "task must remain in 'backlog' — move must NOT be persisted on wrong password"
+      );
+    } finally {
+      await srv.close();
+    }
   });
 });

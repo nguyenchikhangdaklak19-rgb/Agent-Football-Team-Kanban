@@ -6,7 +6,7 @@
  *
  * Auth approach (option a — two-step):
  *   1. POST /api/login with { password } → server issues an HMAC-signed session
- *      cookie named "token".
+ *      cookie named auth.COOKIE_NAME (currently "board_token").
  *   2. POST /api/move with that cookie (Cookie header) and the move payload.
  *
  * Configuration precedence (flags override env):
@@ -14,6 +14,8 @@
  *   - password:    --password <pw> >  env BOARD_PASSWORD
  */
 "use strict";
+
+const auth = require("./auth");
 
 /**
  * isRemoteConfigured(opts) — returns true when both a remote URL and a
@@ -54,8 +56,8 @@ function resolveConfig(opts) {
  * remoteMove(opts) — authenticate then POST /api/move.
  *
  * Steps:
- *   1. POST <url>/api/login { password } — expects a Set-Cookie: token=...
- *   2. POST <url>/api/move  { id, to, by, testsPass } with Cookie: token=...
+ *   1. POST <url>/api/login { password } — expects a Set-Cookie: board_token=...
+ *   2. POST <url>/api/move  { id, to, by, testsPass } with Cookie: board_token=...
  *
  * @param {object} opts
  * @param {string}   opts.url        — base URL of the Vercel deployment (no trailing slash)
@@ -96,10 +98,22 @@ async function remoteMove(opts) {
   }
 
   // Extract the session cookie from the Set-Cookie header.
+  // The Set-Cookie header contains a single cookie with attributes:
+  //   "board_token=<value>; Path=/; HttpOnly; ..."
+  // We must parse the name=value portion (before the first ";") keyed on
+  // auth.COOKIE_NAME so the cookie name can never drift from the server's
+  // expectation.  A naive substring match like /token=([^;]+)/ would
+  // incorrectly capture values from a cookie named "board_token" as
+  // "token=<value>", which the server's auth gate would not recognise.
   const setCookie = loginRes.headers.get("set-cookie") || "";
-  // Parse out the token value (format: "token=<value>; Path=/; ...")
-  const tokenMatch = setCookie.match(/token=([^;]+)/);
-  const cookie = tokenMatch ? "token=" + tokenMatch[1] : "";
+  // parseCookies handles "name=value; Attr; Attr" correctly: it splits on ";"
+  // and for each part takes the text before the first "=" as the name.
+  // For Set-Cookie we only care about the first pair (the actual cookie), not
+  // the attributes — extract just the "name=value" segment before the first ";".
+  const cookiePair = setCookie.split(";")[0]; // e.g. "board_token=<value>"
+  const parsedSetCookie = auth.parseCookies(cookiePair);
+  const tokenValue = parsedSetCookie[auth.COOKIE_NAME];
+  const cookie = tokenValue ? auth.COOKIE_NAME + "=" + tokenValue : "";
 
   // Step 2: POST /api/move with the session cookie.
   const movePayload = {
