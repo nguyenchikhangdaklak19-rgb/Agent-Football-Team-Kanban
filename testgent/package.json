@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node server.js",
     "test": "node --test test/*.test.js",
-    "board": "node board.js"
+    "board": "node board.js",
+    "seed": "node scripts/seed-kv.js"
   }
 }
