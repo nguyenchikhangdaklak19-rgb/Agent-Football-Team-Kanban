@@ -1,21 +1,30 @@
 /*
- * board-client.js — live client for the Team Board.
+ * board-client.js — authenticated client for the Team Board (Vercel edition).
  *
- * Drives the static shell in index.html (element IDs: tabs, pending, prog-label,
- * prog-bar, epics, board) from the live API instead of hardcoded data:
- *   - GET  /api/board   -> { workflow, projects }   (source of truth)
- *   - POST /api/move    -> PO Duyệt/Trả lại actions
- *   - GET  /api/stream  -> SSE; on `update` re-fetch + re-render
+ * Drives the static shell in index.html from the auth-protected API:
+ *   - GET  /api/board   -> { workflow, projects }   (requires session cookie)
+ *   - POST /api/login   -> sets HttpOnly session cookie
+ *   - POST /api/move    -> PO Duyệt/Trả lại actions (requires session cookie)
  *
- * Reproduces the reference mock (team-board.html): same COLUMNS, STATE_CLASS,
- * card structure and CSS classnames so board.css applies unchanged. The only
- * difference is the data is live: agent codes are `tl`/`engineer`/`qa`, tasks
- * carry `deps` (array) + `depMet` + `reject`, and approve/reject hit the API.
+ * Auth flow:
+ *   1. On boot, attempt GET /api/board with credentials:'same-origin'.
+ *   2. If 401 → show login overlay, hide board.
+ *   3. Login: POST /api/login { password }. On 200 → hide overlay, load board.
+ *      On non-2xx → show error in #login-error, keep board hidden.
+ *   4. After auth, poll /api/board every POLL_MS ms. If any fetch returns 401
+ *      (session expired) → drop back to login screen.
+ *   5. Logout button: POST /api/logout (best-effort), then drop to login.
+ *   6. Refresh button: immediate re-fetch without waiting for the poll timer.
+ *
+ * SSE / EventSource has been removed — the spec explicitly out-of-scopes it.
  *
  * Vanilla JS, no deps, no build.
  */
 (function () {
   "use strict";
+
+  // Poll interval for background refresh after login (ms).
+  var POLL_MS = 30000;
 
   // agent code -> label + colour token. Live data uses engineer/qa (the mock
   // used eng); we map both so either dataset renders.
@@ -37,64 +46,100 @@
   var STATE_CLASS = { progress: "is-progress", test: "is-test", uat: "is-uat", done: "is-done" };
 
   // --- state -----------------------------------------------------------------
-  // Selected project id + epic id ("all" = aggregate). Preserved across SSE
+  // Selected project id + epic id ("all" = aggregate). Preserved across poll
   // re-renders; reset epic to "all" only when the project changes.
   var DATA = { projects: [] };
   var state = { proj: null, epic: "all" };
 
+  // Background poll timer handle.
+  var pollTimer = null;
+
   var $ = function (id) { return document.getElementById(id); };
 
-  function getProject() {
-    var projects = DATA.projects || [];
-    var p = projects.find(function (x) { return x.id === state.proj; });
-    return p || projects[0] || null;
+  // --- login / session UI helpers --------------------------------------------
+
+  function showLogin(errorMsg) {
+    var overlay = $("login-overlay");
+    var content = $("board-content");
+    if (overlay) overlay.removeAttribute("hidden");
+    if (content) content.setAttribute("hidden", "");
+    // Reset form state.
+    var pw = $("login-password");
+    if (pw) { pw.value = ""; pw.focus(); }
+    var errEl = $("login-error");
+    if (errEl) errEl.textContent = errorMsg || "";
+    stopPoll();
   }
 
-  // Flatten the selected project's tasks into {t, ep} rows.
-  function projectTasks() {
-    var out = [];
-    var p = getProject();
-    if (!p) return out;
-    (p.epics || []).forEach(function (ep) {
-      (ep.tasks || []).forEach(function (t) { out.push({ t: t, ep: ep }); });
-    });
-    return out;
+  function showBoard() {
+    var overlay = $("login-overlay");
+    var content = $("board-content");
+    if (overlay) overlay.setAttribute("hidden", "");
+    if (content) content.removeAttribute("hidden");
   }
 
-  function prog(list) {
-    var tot = list.length;
-    var d = list.filter(function (t) { return t.status === "done"; }).length;
-    return { d: d, tot: tot, pct: tot ? Math.round((d / tot) * 100) : 0 };
+  function setLoginError(msg) {
+    var el = $("login-error");
+    if (el) el.textContent = msg || "";
   }
 
-  function allTasks() {
-    var p = getProject();
-    if (!p) return [];
-    return (p.epics || []).reduce(function (acc, e) { return acc.concat(e.tasks || []); }, []);
+  function setLoginBusy(busy) {
+    var btn = $("login-submit");
+    var pw = $("login-password");
+    if (btn) btn.disabled = busy;
+    if (pw) pw.disabled = busy;
   }
 
-  // dep tag helper — live data uses `deps` (array); also tolerate a `dep` string.
-  function depList(t) {
-    if (Array.isArray(t.deps)) return t.deps;
-    if (t.dep) return [t.dep];
-    return [];
+  // --- poll helpers ----------------------------------------------------------
+
+  function startPoll() {
+    stopPoll();
+    pollTimer = setInterval(function () { load(); }, POLL_MS);
+  }
+
+  function stopPoll() {
+    if (pollTimer !== null) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
   }
 
   // --- API -------------------------------------------------------------------
+
   function fetchBoard() {
-    return fetch("/api/board", { headers: { Accept: "application/json" } })
-      .then(function (r) {
-        if (!r.ok) throw new Error("GET /api/board " + r.status);
-        return r.json();
-      });
+    return fetch("/api/board", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+  }
+
+  function postLogin(password) {
+    return fetch("/api/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password }),
+    });
+  }
+
+  function postLogout() {
+    return fetch("/api/logout", {
+      method: "POST",
+      credentials: "same-origin",
+    }).catch(function () { /* best-effort */ });
   }
 
   function postMove(payload) {
     return fetch("/api/move", {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }).then(function (r) {
+      if (r.status === 401) {
+        showLogin("Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.");
+        return { ok: false, error: "Phiên đăng nhập đã hết hạn." };
+      }
       return r.json().catch(function () { return { ok: false, error: "HTTP " + r.status }; });
     });
   }
@@ -105,7 +150,7 @@
     postMove({ id: id, to: to, by: "po" })
       .then(function (res) {
         if (res && res.ok) {
-          // Refresh immediately; the SSE `update` will also fire (idempotent).
+          // Refresh immediately after the action.
           load();
         } else {
           surfaceError((res && res.error) || "Không thực hiện được", btn);
@@ -165,6 +210,42 @@
       renderBoard();
     };
     return b;
+  }
+
+  function getProject() {
+    var projects = DATA.projects || [];
+    var p = projects.find(function (x) { return x.id === state.proj; });
+    return p || projects[0] || null;
+  }
+
+  // Flatten the selected project's tasks into {t, ep} rows.
+  function projectTasks() {
+    var out = [];
+    var p = getProject();
+    if (!p) return out;
+    (p.epics || []).forEach(function (ep) {
+      (ep.tasks || []).forEach(function (t) { out.push({ t: t, ep: ep }); });
+    });
+    return out;
+  }
+
+  function prog(list) {
+    var tot = list.length;
+    var d = list.filter(function (t) { return t.status === "done"; }).length;
+    return { d: d, tot: tot, pct: tot ? Math.round((d / tot) * 100) : 0 };
+  }
+
+  function allTasks() {
+    var p = getProject();
+    if (!p) return [];
+    return (p.epics || []).reduce(function (acc, e) { return acc.concat(e.tasks || []); }, []);
+  }
+
+  // dep tag helper — live data uses `deps` (array); also tolerate a `dep` string.
+  function depList(t) {
+    if (Array.isArray(t.deps)) return t.deps;
+    if (t.dep) return [t.dep];
+    return [];
   }
 
   function renderEpics() {
@@ -276,9 +357,21 @@
   }
 
   // --- data load -------------------------------------------------------------
+  // Returns a promise that resolves to true (success) or false (needs login).
   function load() {
     return fetchBoard()
+      .then(function (r) {
+        if (r.status === 401) {
+          showLogin("Phi\xEAn đăng nhập đ\xE3 hết hạn. Vui l\xF2ng đăng nhập lại.");
+          return false;
+        }
+        if (!r.ok) {
+          throw new Error("GET /api/board " + r.status);
+        }
+        return r.json();
+      })
       .then(function (data) {
+        if (data === false) return false;
         DATA = data && data.projects ? data : { projects: [] };
         var projects = DATA.projects || [];
         // Keep selected project if it still exists; else default to first.
@@ -293,6 +386,7 @@
           }
         }
         renderAll();
+        return true;
       })
       .catch(function (e) {
         var board = $("board");
@@ -301,24 +395,95 @@
             '<section class="col"><div class="col-head"><h2>Lỗi tải dữ liệu</h2></div>' +
             '<div style="font-size:12px;color:var(--error);padding:8px">' + escapeHtml(String(e && e.message ? e.message : e)) + "</div></section>";
         }
+        return false;
       });
   }
 
-  // --- real-time (SSE) -------------------------------------------------------
-  // On every `update` event, re-fetch /api/board and re-render. EventSource
-  // reconnects automatically on drop. Selected project/epic are preserved by load().
-  function connectStream() {
-    if (typeof EventSource === "undefined") return;
-    var es = new EventSource("/api/stream");
-    es.addEventListener("update", function () { load(); });
-    // Also handle default-named messages defensively.
-    es.onmessage = function () { load(); };
+  // --- login form handler ----------------------------------------------------
+  function handleLogin(e) {
+    e.preventDefault();
+    var pw = $("login-password");
+    var password = pw ? pw.value : "";
+    if (!password) {
+      setLoginError("Vui l\xF2ng nhập mật khẩu.");
+      return;
+    }
+    setLoginError("");
+    setLoginBusy(true);
+
+    postLogin(password)
+      .then(function (r) {
+        if (r.ok) {
+          // Server set the session cookie; now fetch the board.
+          showBoard();
+          return load().then(function () {
+            startPoll();
+          });
+        } else {
+          return r.json()
+            .catch(function () { return {}; })
+            .then(function (body) {
+              var msg = (body && body.error) || "Mật khẩu kh\xF4ng đ\xFAng. Vui l\xF2ng thử lại.";
+              setLoginError(msg);
+            });
+        }
+      })
+      .catch(function (err) {
+        setLoginError("Lỗi kết nối: " + String(err && err.message ? err.message : err));
+      })
+      .then(function () {
+        setLoginBusy(false);
+      });
+  }
+
+  // --- logout ----------------------------------------------------------------
+  function handleLogout() {
+    stopPoll();
+    postLogout().then(function () {
+      showLogin("");
+    });
   }
 
   // --- boot ------------------------------------------------------------------
   function boot() {
-    load();
-    connectStream();
+    // Wire up login form.
+    var form = $("login-form");
+    if (form) form.addEventListener("submit", handleLogin);
+
+    // Wire up logout button.
+    var logoutBtn = $("logout-btn");
+    if (logoutBtn) logoutBtn.addEventListener("click", handleLogout);
+
+    // Wire up manual refresh button.
+    var refreshBtn = $("refresh-btn");
+    if (refreshBtn) refreshBtn.addEventListener("click", function () { load(); });
+
+    // Attempt to load the board immediately. If session cookie is already valid
+    // (e.g. user reloaded the page), we skip the login screen entirely.
+    fetchBoard().then(function (r) {
+      if (r.status === 401) {
+        // Not authenticated — show login overlay (it is already visible by default).
+        return;
+      }
+      if (!r.ok) {
+        // Some other error; stay on login, show generic message.
+        setLoginError("Kh\xF4ng thể kết nối tới server (" + r.status + ").");
+        return;
+      }
+      return r.json().then(function (data) {
+        // Already authenticated; load the board directly.
+        DATA = data && data.projects ? data : { projects: [] };
+        var projects = DATA.projects || [];
+        if (projects.length) {
+          state.proj = projects[0].id;
+        }
+        showBoard();
+        renderAll();
+        startPoll();
+      });
+    }).catch(function () {
+      // Network error; leave on login, do nothing.
+    });
   }
 
   if (document.readyState === "loading") {
