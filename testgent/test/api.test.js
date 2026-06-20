@@ -50,6 +50,29 @@ function makeMockClient(initialStore) {
       store[key] = String(next);
       return next;
     },
+    /**
+     * eval() — atomic CAS matching kv-store's CAS_SCRIPT semantics.
+     * keys[0]=boardKey, keys[1]=versionKey
+     * args[0]=expectedVersion (string), args[1]=newBoardJSON
+     * Returns [1, newVersion] on success, [0, storedVersion] on conflict.
+     *
+     * The entire body executes synchronously (no await inside) — modelling
+     * Redis Lua atomicity: no other coroutine can observe an intermediate
+     * state between the version-check and the board-write.
+     */
+    async eval(script, keys, args) {
+      const boardKey = keys[0];
+      const versionKey = keys[1];
+      const stored = versionKey in store ? (Number(store[versionKey]) || 0) : 0;
+      const expected = Number(args[0]);
+      if (stored !== expected) {
+        return [0, stored];
+      }
+      store[boardKey] = args[1];
+      const newv = stored + 1;
+      store[versionKey] = String(newv);
+      return [1, newv];
+    },
     _store: store,
   };
 }
@@ -666,6 +689,24 @@ test("concurrency: two concurrent valid move requests both persist (no lost upda
         }
         return 1;
       },
+      /**
+       * eval() — atomic CAS. ONE tick for network RTT, then the CAS body
+       * executes synchronously (no further await), modelling Redis Lua atomicity.
+       * keys[0]=boardKey, keys[1]=versionKey
+       * args[0]=expectedVersion, args[1]=newBoardJSON
+       * Returns [1, newVersion] on success, [0, storedVersion] on conflict.
+       */
+      async eval(script, keys, args) {
+        await Promise.resolve(); // network RTT — other coroutines may advance here
+        // CAS body runs synchronously (atomic w.r.t. the event loop):
+        const expected = Number(args[0]);
+        if (state.version !== expected) {
+          return [0, state.version];
+        }
+        state.board = args[1];
+        state.version += 1;
+        return [1, state.version];
+      },
     };
   }
 
@@ -1055,32 +1096,21 @@ test("move: test->uat with truthy-but-not-true testsPass ('yes') => 409 (strict 
 
 test("concurrency: forced CAS contention through move handler => both persist, no lost update", async () => {
   /*
-   * REVIEWER FINDING (currently RED): this exposes a lost-update defect in the
-   * shared lib/kv-store.js CAS that /api/move relies on for the spec's
-   * concurrency acceptance criterion ("hai move gần như đồng thời không nuốt
-   * mất nhau").
+   * Drives genuine CAS contention through the move handler using the atomic
+   * Lua EVAL CAS design in kv-store.update().
    *
-   * Drives genuine contention: both load() calls observe version 0 before
-   * either INCR runs. The backend serializes INCR (Redis semantics) so exactly
-   * one writer reserves version 1 and writes; the other gets version 2, detects
-   * the conflict, reloads, and retries.
+   * Both load() calls observe version 0 before either eval() runs (forced via
+   * a gate on the board GET). Then their eval() calls race: the atomic CAS body
+   * ensures exactly one writer commits at version 0→1; the other gets a conflict
+   * (stored≠expected), reloads fresh data (version 1), and retries at version 1→2.
    *
-   * The bug: kv-store.update() reserves a version slot via INCR, but the board
-   * SET is a SEPARATE, LATER command. The losing writer's retry GET(board) can
-   * land in the window AFTER the winner's INCR but BEFORE the winner's SET,
-   * reading STALE board state, then SET its own mutation over the winner's =>
-   * the winner's move is silently lost. INCR-as-reservation does not fence the
-   * board read against an in-flight, uncommitted board write.
-   *
-   * Owned by T5? No — the fix belongs in lib/kv-store.js (T1). This test stays
-   * red until that CAS is made safe (e.g. single atomic Lua check-and-set, or a
-   * version embedded in the board value compared inside one atomic op).
-   *
-   * Both moves must end up persisted (no lost update).
+   * Because eval() is atomic (no yield inside the CAS body after the network RTT),
+   * no interleave is possible between the version-check and the board-write.
+   * Both moves always end up persisted (no lost update).
    */
   const state = { board: JSON.stringify(SAMPLE_BOARD), version: 0 };
 
-  // Gate that releases both load()s only after BOTH have read version 0.
+  // Gate that releases both load()s only after BOTH have read the board at version 0.
   let loadCount = 0;
   let releaseBoth;
   const bothLoaded = new Promise((r) => { releaseBoth = r; });
@@ -1092,7 +1122,7 @@ test("concurrency: forced CAS contention through move handler => both persist, n
           const snapshot = state.board;
           loadCount += 1;
           if (loadCount === 2) releaseBoth();
-          // Hold until both readers have captured the current snapshot.
+          // Hold until both readers have captured the current snapshot at version 0.
           await bothLoaded;
           return snapshot;
         }
@@ -1104,13 +1134,31 @@ test("concurrency: forced CAS contention through move handler => both persist, n
         if (key === "board") state.board = value;
       },
       async incr(key) {
-        // Serialized atomic increment (Redis INCR semantics).
+        // Used by save() / kv-store internals (not by update()'s CAS path).
         await Promise.resolve();
         if (key === "board:version") {
           state.version += 1;
           return state.version;
         }
         return 1;
+      },
+      /**
+       * eval() — atomic CAS matching kv-store's CAS_SCRIPT semantics.
+       * ONE tick for the network RTT; CAS body executes synchronously (atomic).
+       * keys[0]=boardKey, keys[1]=versionKey
+       * args[0]=expectedVersion, args[1]=newBoardJSON
+       * Returns [1, newVersion] on success, [0, storedVersion] on conflict.
+       */
+      async eval(script, keys, args) {
+        await Promise.resolve(); // network RTT — the other coroutine may advance here
+        // CAS body is synchronous — no further yield, no interleave possible:
+        const expected = Number(args[0]);
+        if (state.version !== expected) {
+          return [0, state.version]; // conflict
+        }
+        state.board = args[1];
+        state.version += 1;
+        return [1, state.version]; // success
       },
     };
   }
