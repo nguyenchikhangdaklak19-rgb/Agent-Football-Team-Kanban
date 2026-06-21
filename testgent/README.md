@@ -219,7 +219,7 @@ npm test
 ```
 
 Requires **Node >= 18** (uses the built-in test runner and `globalThis.fetch`).
-All 309 tests must pass before merging.
+All 317 tests must pass before merging.
 
 `npm start` runs the legacy local HTTP server (`server.js`) on port 3000,
 serving the board from `board-data.json` on disk. This is useful for UI
